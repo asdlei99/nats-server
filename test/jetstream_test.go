@@ -83,6 +83,8 @@ func RunBasicJetStreamServer() *server.Server {
 	opts := DefaultTestOptions
 	opts.Port = -1
 	opts.JetStream = true
+	tdir, _ := ioutil.TempDir(os.TempDir(), "jstests-storedir-")
+	opts.StoreDir = tdir
 	return RunServer(&opts)
 }
 
@@ -867,10 +869,10 @@ func TestJetStreamAddStreamBadSubjects(t *testing.T) {
 		}
 	}
 
-	expectAPIErr(server.StreamConfig{Name: "MyStream", Subjects: []string{"foo.bar."}})
-	expectAPIErr(server.StreamConfig{Name: "MyStream", Subjects: []string{".."}})
-	expectAPIErr(server.StreamConfig{Name: "MyStream", Subjects: []string{".*"}})
-	expectAPIErr(server.StreamConfig{Name: "MyStream", Subjects: []string{".>"}})
+	expectAPIErr(server.StreamConfig{Name: "MyStream", Storage: server.MemoryStorage, Subjects: []string{"foo.bar."}})
+	expectAPIErr(server.StreamConfig{Name: "MyStream", Storage: server.MemoryStorage, Subjects: []string{".."}})
+	expectAPIErr(server.StreamConfig{Name: "MyStream", Storage: server.MemoryStorage, Subjects: []string{".*"}})
+	expectAPIErr(server.StreamConfig{Name: "MyStream", Storage: server.MemoryStorage, Subjects: []string{".>"}})
 }
 
 func TestJetStreamAddStreamMaxConsumers(t *testing.T) {
@@ -886,6 +888,7 @@ func TestJetStreamAddStreamMaxConsumers(t *testing.T) {
 
 	cfg := &server.StreamConfig{
 		Name:         "MAXC",
+		Storage:      server.MemoryStorage,
 		Subjects:     []string{"in.maxc.>"},
 		MaxConsumers: 1,
 	}
@@ -904,8 +907,8 @@ func TestJetStreamAddStreamMaxConsumers(t *testing.T) {
 func TestJetStreamAddStreamOverlappingSubjects(t *testing.T) {
 	mconfig := &server.StreamConfig{
 		Name:     "ok",
-		Subjects: []string{"foo", "bar", "baz.*", "foo.bar.baz.>"},
 		Storage:  server.MemoryStorage,
+		Subjects: []string{"foo", "bar", "baz.*", "foo.bar.baz.>"},
 	}
 
 	s := RunBasicJetStreamServer()
@@ -1571,7 +1574,7 @@ func TestJetStreamWorkQueueMaxWaiting(t *testing.T) {
 			checkSubPending := func(numExpected int) {
 				t.Helper()
 				checkFor(t, 200*time.Millisecond, 10*time.Millisecond, func() error {
-					if nmsgs, _, _ := sub.Pending(); err != nil || nmsgs != numExpected {
+					if nmsgs, _, err := sub.Pending(); err != nil || nmsgs != numExpected {
 						return fmt.Errorf("Did not receive correct number of messages: %d vs %d", nmsgs, numExpected)
 					}
 					return nil
@@ -4172,7 +4175,9 @@ func TestJetStreamSnapshotsAPI(t *testing.T) {
 	opts := DefaultTestOptions
 	opts.ServerName = "S"
 	opts.Port = -1
+	tdir, _ := ioutil.TempDir(os.TempDir(), "jstests-storedir-")
 	opts.JetStream = true
+	opts.StoreDir = tdir
 	rurl, _ := url.Parse(fmt.Sprintf("nats-leaf://%s:%d", lopts.LeafNode.Host, lopts.LeafNode.Port))
 	opts.LeafNode.Remotes = []*server.RemoteLeafOpts{{URLs: []*url.URL{rurl}}}
 
@@ -6473,7 +6478,7 @@ func TestJetStreamSystemLimits(t *testing.T) {
 	// Now test max streams and max consumers. Note max consumers is per stream.
 	for i := 0; i < 10; i++ {
 		mname := fmt.Sprintf("foo.%d", i)
-		mset, err := facc.AddStream(&server.StreamConfig{Name: strconv.Itoa(i), Subjects: []string{mname}})
+		mset, err := facc.AddStream(&server.StreamConfig{Name: strconv.Itoa(i), Storage: server.MemoryStorage, Subjects: []string{mname}})
 		if err != nil {
 			t.Fatalf("Unexpected error adding stream: %v", err)
 		}
@@ -6481,7 +6486,7 @@ func TestJetStreamSystemLimits(t *testing.T) {
 	}
 
 	// This one should fail since over the limit for max number of streams.
-	if _, err := facc.AddStream(&server.StreamConfig{Name: "22", Subjects: []string{"foo.22"}}); err == nil {
+	if _, err := facc.AddStream(&server.StreamConfig{Name: "22", Storage: server.MemoryStorage, Subjects: []string{"foo.22"}}); err == nil {
 		t.Fatalf("Expected error adding stream over limit")
 	}
 
@@ -6491,17 +6496,17 @@ func TestJetStreamSystemLimits(t *testing.T) {
 	}
 
 	// Now try to add one with bytes limit that would exceed the account limit.
-	if _, err := facc.AddStream(&server.StreamConfig{Name: "22", MaxBytes: jsconfig.MaxMemory * 2}); err == nil {
+	if _, err := facc.AddStream(&server.StreamConfig{Name: "22", Storage: server.MemoryStorage, MaxBytes: jsconfig.MaxStore * 2}); err == nil {
 		t.Fatalf("Expected error adding stream over limit")
 	}
 
 	// Replicas can't be > 1
-	if _, err := facc.AddStream(&server.StreamConfig{Name: "22", Replicas: 10}); err == nil {
+	if _, err := facc.AddStream(&server.StreamConfig{Name: "22", Storage: server.MemoryStorage, Replicas: 10}); err == nil {
 		t.Fatalf("Expected error adding stream over limit")
 	}
 
 	// Test consumers limit against account limit when the stream does not set a limit
-	mset, err := facc.AddStream(&server.StreamConfig{Name: "22", Subjects: []string{"foo.22"}})
+	mset, err := facc.AddStream(&server.StreamConfig{Name: "22", Storage: server.MemoryStorage, Subjects: []string{"foo.22"}})
 	if err != nil {
 		t.Fatalf("Unexpected error adding stream: %v", err)
 	}
@@ -6521,7 +6526,7 @@ func TestJetStreamSystemLimits(t *testing.T) {
 
 	// Test consumer limit against stream limit
 	mset.Delete()
-	mset, err = facc.AddStream(&server.StreamConfig{Name: "22", Subjects: []string{"foo.22"}, MaxConsumers: 5})
+	mset, err = facc.AddStream(&server.StreamConfig{Name: "22", Storage: server.MemoryStorage, Subjects: []string{"foo.22"}, MaxConsumers: 5})
 	if err != nil {
 		t.Fatalf("Unexpected error adding stream: %v", err)
 	}
@@ -6542,7 +6547,7 @@ func TestJetStreamSystemLimits(t *testing.T) {
 	// Test the account having smaller limits than the stream
 	mset.Delete()
 
-	mset, err = facc.AddStream(&server.StreamConfig{Name: "22", Subjects: []string{"foo.22"}, MaxConsumers: 10})
+	mset, err = facc.AddStream(&server.StreamConfig{Name: "22", Storage: server.MemoryStorage, Subjects: []string{"foo.22"}, MaxConsumers: 10})
 	if err != nil {
 		t.Fatalf("Unexpected error adding stream: %v", err)
 	}
@@ -6564,7 +6569,6 @@ func TestJetStreamSystemLimits(t *testing.T) {
 	if _, err := mset.AddConsumer(&server.ConsumerConfig{Durable: "O:22", AckPolicy: server.AckExplicit}); err == nil {
 		t.Fatalf("Expected error adding consumer over the limit")
 	}
-
 }
 
 func TestJetStreamStreamStorageTrackingAndLimits(t *testing.T) {
@@ -6588,7 +6592,7 @@ func TestJetStreamStreamStorageTrackingAndLimits(t *testing.T) {
 		t.Fatalf("Unexpected error updating jetstream account limits: %v", err)
 	}
 
-	mset, err := gacc.AddStream(&server.StreamConfig{Name: "LIMITS", Retention: server.WorkQueuePolicy})
+	mset, err := gacc.AddStream(&server.StreamConfig{Name: "LIMITS", Storage: server.MemoryStorage, Retention: server.WorkQueuePolicy})
 	if err != nil {
 		t.Fatalf("Unexpected error adding stream: %v", err)
 	}
@@ -6614,7 +6618,7 @@ func TestJetStreamStreamStorageTrackingAndLimits(t *testing.T) {
 	}
 
 	// Do second stream.
-	mset2, err := gacc.AddStream(&server.StreamConfig{Name: "NUM22", Retention: server.WorkQueuePolicy})
+	mset2, err := gacc.AddStream(&server.StreamConfig{Name: "NUM22", Storage: server.MemoryStorage, Retention: server.WorkQueuePolicy})
 	if err != nil {
 		t.Fatalf("Unexpected error adding stream: %v", err)
 	}
@@ -6696,7 +6700,7 @@ func TestJetStreamStreamStorageTrackingAndLimits(t *testing.T) {
 	}
 }
 
-func TestJetStreamStreamFileStorageTrackingAndLimits(t *testing.T) {
+func TestJetStreamStreamFileTrackingAndLimits(t *testing.T) {
 	s := RunBasicJetStreamServer()
 	defer s.Shutdown()
 
@@ -6826,7 +6830,7 @@ type info struct {
 	obs   []obsi
 }
 
-func TestJetStreamSimpleFileStorageRecovery(t *testing.T) {
+func TestJetStreamSimpleFileRecovery(t *testing.T) {
 	base := runtime.NumGoroutine()
 
 	s := RunRandClientPortServer()
@@ -6951,6 +6955,41 @@ func TestJetStreamSimpleFileStorageRecovery(t *testing.T) {
 	}
 }
 
+func TestJetStreamInfoAPIWithHeaders(t *testing.T) {
+	s := RunBasicJetStreamServer()
+	defer s.Shutdown()
+
+	// Forced cleanup of all persisted state.
+	if config := s.JetStreamConfig(); config != nil {
+		defer os.RemoveAll(config.StoreDir)
+	}
+
+	// Client for API requests.
+	nc := clientConnectToServer(t, s)
+	defer nc.Close()
+
+	m := nats.NewMsg(server.JSApiAccountInfo)
+	m.Header.Add("Accept-Encoding", "json")
+	m.Header.Add("Authorization", "s3cr3t")
+	m.Data = []byte("HELLO-JS!")
+
+	resp, err := nc.RequestMsg(m, time.Second)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	var info server.JSApiAccountInfoResponse
+	if err := json.Unmarshal(resp.Data, &info); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	fmt.Printf("Info is %+v\n", info)
+
+	if info.Error != nil {
+		t.Fatalf("Received an error: %+v", info.Error)
+	}
+
+}
+
 func TestJetStreamRequestAPI(t *testing.T) {
 	s := RunBasicJetStreamServer()
 	defer s.Shutdown()
@@ -6991,7 +7030,7 @@ func TestJetStreamRequestAPI(t *testing.T) {
 		t.Fatalf("Unexpected error: %v", err)
 	}
 	if scResp.StreamInfo == nil || scResp.Error != nil {
-		t.Fatalf("Did not receive correct response")
+		t.Fatalf("Did not receive correct response: %+v", scResp.Error)
 	}
 	if time.Since(scResp.Created) > time.Second {
 		t.Fatalf("Created time seems wrong: %v\n", scResp.Created)
@@ -7214,8 +7253,7 @@ func TestJetStreamRequestAPI(t *testing.T) {
 	}
 	// Do some sanity checking.
 	// Must match consumer.go
-	const randConsumerNameLen = 6
-
+	const randConsumerNameLen = 8
 	if len(oinfo.Name) != randConsumerNameLen {
 		t.Fatalf("Expected ephemeral name, got %q", oinfo.Name)
 	}
@@ -7550,7 +7588,7 @@ func TestJetStreamAPIStreamListPaging(t *testing.T) {
 	streamsNum := 2 * server.JSApiNamesLimit
 	for i := 1; i <= streamsNum; i++ {
 		name := fmt.Sprintf("STREAM-%06d", i)
-		cfg := server.StreamConfig{Name: name}
+		cfg := server.StreamConfig{Name: name, Storage: server.MemoryStorage}
 		_, err := s.GlobalAccount().AddStream(&cfg)
 		if err != nil {
 			t.Fatalf("Unexpected error adding stream: %v", err)
@@ -10105,7 +10143,7 @@ func TestJetStreamAccountImportBasics(t *testing.T) {
 		t.Fatalf("Expected subject of %q, got %q", "ORDERS.foo", m.Subject)
 	}
 	// Now make sure we can ack messages correctly.
-	m.Ack()
+	m.Respond(server.AckAck)
 	nc.Flush()
 
 	if info := o.Info(); info.AckFloor.Consumer != 1 {
@@ -10142,7 +10180,7 @@ func TestJetStreamAccountImportAll(t *testing.T) {
 			},
 			IU: {
 				users: [ {user: rip, password: bar} ]
-				imports [ { service: { subject: "$JS.API.>", account: JS } , to: "jsapi.>" } ]
+				imports [ { service: { subject: "$JS.API.>", account: JS }, to: "jsapi.>"} ]
 			},
 		}
 	`))

@@ -3241,6 +3241,7 @@ func TestExpiredUserCredentialsRenewal(t *testing.T) {
 		nats.ReconnectWait(25*time.Millisecond),
 		nats.ReconnectJitter(0, 0),
 		nats.MaxReconnects(2),
+		nats.ErrorHandler(noOpErrHandler),
 		nats.ReconnectHandler(func(nc *nats.Conn) {
 			rch <- true
 		}),

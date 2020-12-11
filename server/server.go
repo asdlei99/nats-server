@@ -231,6 +231,11 @@ type Server struct {
 	// Holds cluster name under different lock for mapping
 	cnMu sync.RWMutex
 	cn   string
+
+	// For registering raft nodes with the server.
+	rnMu        sync.RWMutex
+	raftNodes   map[string]RaftNode
+	raftLeaders map[string]RaftNode
 }
 
 // Make sure all are 64bits for atomic use
@@ -263,7 +268,7 @@ func NewServer(opts *Options) (*Server, error) {
 	pub, _ := kp.PublicKey()
 
 	serverName := pub
-	if opts.ServerName != "" {
+	if opts.ServerName != _EMPTY_ {
 		serverName = opts.ServerName
 	}
 
@@ -539,6 +544,9 @@ func validateOptions(o *Options) error {
 	if err := validateMQTTOptions(o); err != nil {
 		return err
 	}
+	if err := validateJetStreamOptions(o); err != nil {
+		return err
+	}
 	// Finally check websocket options.
 	return validateWebsocketOptions(o)
 }
@@ -756,6 +764,10 @@ func (s *Server) globalAccountOnly() bool {
 func (s *Server) standAloneMode() bool {
 	opts := s.getOpts()
 	return opts.Cluster.Port == 0 && opts.LeafNode.Port == 0 && opts.Gateway.Port == 0
+}
+
+func (s *Server) configuredRoutes() int {
+	return len(s.getOpts().Routes)
 }
 
 // isTrustedIssuer will check that the issuer is a trusted public key.
@@ -1726,6 +1738,14 @@ func (s *Server) AcceptLoop(clr chan struct{}) {
 		s.mu.Unlock()
 		return
 	}
+
+	s.Noticef("Server name: %s", s.info.Name)
+	if s.sys != nil {
+		s.Noticef("Server node: %s", s.sys.shash)
+	}
+	s.Noticef("Server ID:   %s", s.info.ID)
+	s.Noticef("Server is ready")
+
 	hp := net.JoinHostPort(opts.Host, strconv.Itoa(opts.Port))
 	l, e := natsListen("tcp", hp)
 	if e != nil {
@@ -1740,10 +1760,6 @@ func (s *Server) AcceptLoop(clr chan struct{}) {
 	if opts.TLSConfig != nil {
 		s.Noticef("TLS required for client connections")
 	}
-
-	s.Noticef("Server id is %s", s.info.ID)
-	s.Noticef("Server name is %s", s.info.Name)
-	s.Noticef("Server is ready")
 
 	// If server was started with RANDOM_PORT (-1), opts.Port would be equal
 	// to 0 at the beginning this function. So we need to get the actual port

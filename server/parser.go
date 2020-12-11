@@ -47,6 +47,7 @@ type pubArg struct {
 	queues  [][]byte
 	size    int
 	hdr     int
+	proxy   *Account
 }
 
 // Parser constants
@@ -1126,7 +1127,7 @@ func (c *client) parse(buf []byte) error {
 		// read buffer and we are not able to process the msg.
 
 		if c.argBuf == nil {
-			// Works also for MSG_ARG, when message comes from ROUTE.
+			// Works also for MSG_ARG, when message comes from ROUTE or GATEWAY.
 			if err := c.clonePubArg(lmsg); err != nil {
 				goto parseErr
 			}

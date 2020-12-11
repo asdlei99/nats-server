@@ -60,6 +60,7 @@ type jetStream struct {
 	mu            sync.RWMutex
 	srv           *Server
 	config        JetStreamConfig
+	cluster       *jetStreamCluster
 	accounts      map[*Account]*jsAccount
 	memReserved   int64
 	storeReserved int64
@@ -90,10 +91,6 @@ type jsAccount struct {
 // If this server is part of a cluster, a system account will need to be defined.
 func (s *Server) EnableJetStream(config *JetStreamConfig) error {
 	s.mu.Lock()
-	if !s.standAloneMode() {
-		s.mu.Unlock()
-		return fmt.Errorf("jetstream restricted to single server mode for now")
-	}
 	if s.js != nil {
 		s.mu.Unlock()
 		return fmt.Errorf("jetstream already enabled")
@@ -141,11 +138,6 @@ func (s *Server) EnableJetStream(config *JetStreamConfig) error {
 		s.SetDefaultSystemAccount()
 	}
 
-	// Setup our internal subscriptions.
-	if err := s.setJetStreamExportSubs(); err != nil {
-		return fmt.Errorf("Error setting up internal jetstream subscriptions: %v", err)
-	}
-
 	s.Warnf("    _ ___ _____ ___ _____ ___ ___   _   __  __")
 	s.Warnf(" _ | | __|_   _/ __|_   _| _ \\ __| /_\\ |  \\/  |")
 	s.Warnf("| || | _|  | | \\__ \\ | | |   / _| / _ \\| |\\/| |")
@@ -163,6 +155,12 @@ func (s *Server) EnableJetStream(config *JetStreamConfig) error {
 	s.Noticef("  Max Memory:      %s", FriendlyBytes(cfg.MaxMemory))
 	s.Noticef("  Max Storage:     %s", FriendlyBytes(cfg.MaxStore))
 	s.Noticef("  Store Directory: %q", cfg.StoreDir)
+	s.Noticef("---------------------------------")
+
+	// Setup our internal subscriptions.
+	if err := s.setJetStreamExportSubs(); err != nil {
+		return fmt.Errorf("Error setting up internal jetstream subscriptions: %v", err)
+	}
 
 	// Setup our internal system exports.
 	sacc := s.SystemAccount()
@@ -174,7 +172,6 @@ func (s *Server) EnableJetStream(config *JetStreamConfig) error {
 			return fmt.Errorf("Error setting up jetstream service exports: %v", err)
 		}
 	}
-	s.Noticef("----------------------------------------")
 
 	// If we have no configured accounts setup then setup imports on global account.
 	if s.globalAccountOnly() {
@@ -183,6 +180,14 @@ func (s *Server) EnableJetStream(config *JetStreamConfig) error {
 		}
 	} else if err := s.configAllJetStreamAccounts(); err != nil {
 		return fmt.Errorf("Error enabling jetstream on configured accounts: %v", err)
+	}
+
+	if !s.standAloneMode() {
+		s.Warnf("JetStream Cluster is ALPHA")
+		if err := s.enableJetStreamClustering(); err != nil {
+			s.Errorf("Could not create JetStream cluster: %v", err)
+			return err
+		}
 	}
 
 	return nil
@@ -340,6 +345,15 @@ func (s *Server) JetStreamConfig() *JetStreamConfig {
 	return c
 }
 
+func (s *Server) StoreDir() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.js == nil {
+		return _EMPTY_
+	}
+	return s.js.config.StoreDir
+}
+
 // JetStreamNumAccounts returns the number of enabled accounts this server is tracking.
 func (s *Server) JetStreamNumAccounts() int {
 	js := s.getJetStream()
@@ -422,23 +436,15 @@ func (a *Account) EnableJetStream(limits *JetStreamAccountLimits) error {
 	s.Debugf("  Max Memory:      %s", FriendlyBytes(limits.MaxMemory))
 	s.Debugf("  Max Storage:     %s", FriendlyBytes(limits.MaxStore))
 
-	// Do quick fixup here for new directory structure.
-	// TODO(dlc) - We can remove once we do MVP IMO.
 	sdir := path.Join(jsa.storeDir, streamsDir)
 	if _, err := os.Stat(sdir); os.IsNotExist(err) {
-		// If we are here that means this is old school directory, upgrade in place.
-		s.Noticef("  Upgrading storage directory structure for %q", a.Name)
-		omdirs, _ := ioutil.ReadDir(jsa.storeDir)
 		if err := os.MkdirAll(sdir, 0755); err != nil {
 			return fmt.Errorf("could not create storage streams directory - %v", err)
-		}
-		for _, fi := range omdirs {
-			os.Rename(path.Join(jsa.storeDir, fi.Name()), path.Join(sdir, fi.Name()))
 		}
 	}
 
 	// Restore any state here.
-	s.Noticef("  Recovering JetStream state for account %q", a.Name)
+	s.Noticef("Recovering JetStream state for account %q", a.Name)
 
 	// Check templates first since messsage sets will need proper ownership.
 	// FIXME(dlc) - Make this consistent.
@@ -528,6 +534,7 @@ func (a *Account) EnableJetStream(limits *JetStreamAccountLimits) error {
 			s.Warnf("  Error unmarshalling Stream metafile: %v", err)
 			continue
 		}
+
 		if cfg.Template != _EMPTY_ {
 			if err := jsa.addStreamNameToTemplate(cfg.Template, cfg.Name); err != nil {
 				s.Warnf("  Error adding Stream %q to Template %q: %v", cfg.Name, cfg.Template, err)
@@ -661,8 +668,9 @@ func (a *Account) LookupStream(name string) (*Stream, error) {
 		return nil, ErrJetStreamNotEnabled
 	}
 	jsa.mu.Lock()
+	defer jsa.mu.Unlock()
+
 	mset, ok := jsa.streams[name]
-	jsa.mu.Unlock()
 	if !ok {
 		return nil, ErrJetStreamStreamNotFound
 	}
@@ -826,10 +834,6 @@ func (jsa *jsAccount) checkLimits(config *StreamConfig) error {
 	if jsa.limits.MaxStreams > 0 && len(jsa.streams) >= jsa.limits.MaxStreams {
 		return fmt.Errorf("maximum number of streams reached")
 	}
-	// FIXME(dlc) - Add check here for replicas based on clustering.
-	if config.Replicas != 1 {
-		return fmt.Errorf("replicas setting of %d not allowed", config.Replicas)
-	}
 	// Check MaxConsumers
 	if config.MaxConsumers > 0 && jsa.limits.MaxConsumers > 0 && config.MaxConsumers > jsa.limits.MaxConsumers {
 		return fmt.Errorf("maximum consumers exceeds account limit")
@@ -978,8 +982,8 @@ func (s *Server) dynJetStreamConfig(storeDir string, maxStore int64) *JetStreamC
 	if storeDir != "" {
 		jsc.StoreDir = filepath.Join(storeDir, JetStreamStoreDir)
 	} else {
-		tdir, _ := ioutil.TempDir(os.TempDir(), "nats-jetstream-storedir-")
-		jsc.StoreDir = filepath.Join(tdir, JetStreamStoreDir)
+		// Create one in temp directory, but make it consistent for restarts.
+		jsc.StoreDir = filepath.Join(os.TempDir(), JetStreamStoreDir)
 	}
 
 	if maxStore > 0 {
@@ -1003,11 +1007,7 @@ func (a *Account) checkForJetStream() (*Server, *jsAccount, error) {
 	jsa := a.js
 	a.mu.RUnlock()
 
-	if s == nil {
-		return nil, nil, fmt.Errorf("jetstream account not registered")
-	}
-
-	if jsa == nil {
+	if s == nil || jsa == nil {
 		return nil, nil, ErrJetStreamNotEnabledForAccount
 	}
 
@@ -1124,7 +1124,7 @@ func (t *StreamTemplate) createTemplateSubscriptions() error {
 	return nil
 }
 
-func (t *StreamTemplate) processInboundTemplateMsg(_ *subscription, _ *client, subject, reply string, msg []byte) {
+func (t *StreamTemplate) processInboundTemplateMsg(_ *subscription, pc *client, subject, reply string, msg []byte) {
 	if t == nil || t.jsa == nil {
 		return
 	}
@@ -1168,7 +1168,7 @@ func (t *StreamTemplate) processInboundTemplateMsg(_ *subscription, _ *client, s
 	}
 
 	// Process this message directly by invoking mset.
-	mset.processInboundJetStreamMsg(nil, nil, subject, reply, msg)
+	mset.processInboundJetStreamMsg(nil, pc, subject, reply, msg)
 }
 
 // LookupStreamTemplate looks up the names stream template.

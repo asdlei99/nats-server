@@ -26,10 +26,12 @@ import (
 type StorageType int
 
 const (
+	// File specifies on disk, designated by the JetStream config StoreDir.
+	FileStorage = StorageType(22)
 	// MemoryStorage specifies in memory only.
-	MemoryStorage StorageType = iota
-	// FileStorage specifies on disk, designated by the JetStream config StoreDir.
-	FileStorage
+	MemoryStorage = StorageType(33)
+	// Any is for internals.
+	AnyStorage = StorageType(44)
 )
 
 var (
@@ -250,6 +252,7 @@ func (dp *DiscardPolicy) UnmarshalJSON(data []byte) error {
 const (
 	memoryStorageString = "memory"
 	fileStorageString   = "file"
+	anyStorageString    = "any"
 )
 
 func (st StorageType) String() string {
@@ -258,6 +261,8 @@ func (st StorageType) String() string {
 		return strings.Title(memoryStorageString)
 	case FileStorage:
 		return strings.Title(fileStorageString)
+	case AnyStorage:
+		return strings.Title(anyStorageString)
 	default:
 		return "Unknown Storage Type"
 	}
@@ -269,6 +274,8 @@ func (st StorageType) MarshalJSON() ([]byte, error) {
 		return json.Marshal(memoryStorageString)
 	case FileStorage:
 		return json.Marshal(fileStorageString)
+	case AnyStorage:
+		return json.Marshal(anyStorageString)
 	default:
 		return nil, fmt.Errorf("can not marshal %v", st)
 	}
@@ -280,6 +287,8 @@ func (st *StorageType) UnmarshalJSON(data []byte) error {
 		*st = MemoryStorage
 	case jsonString(fileStorageString):
 		*st = FileStorage
+	case jsonString(anyStorageString):
+		*st = AnyStorage
 	default:
 		return fmt.Errorf("can not unmarshal %q", data)
 	}

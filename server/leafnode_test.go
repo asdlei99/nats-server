@@ -772,8 +772,8 @@ func TestLeafNodeLoop(t *testing.T) {
 
 	select {
 	case e := <-l.errCh:
-		if !strings.Contains(e, "Loop") {
-			t.Fatalf("Expected error about loop, got %v", e)
+		if !strings.Contains(e, "Duplicate") {
+			t.Fatalf("Expected error about loop through duplicate, got %v", e)
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatalf("Did not get any error regarding loop")

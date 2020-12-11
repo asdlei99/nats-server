@@ -15,8 +15,6 @@ package server
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -165,17 +163,17 @@ type ServerInfo struct {
 
 // ClientInfo is detailed information about the client forming a connection.
 type ClientInfo struct {
-	Start   time.Time  `json:"start,omitempty"`
-	Host    string     `json:"host,omitempty"`
-	ID      uint64     `json:"id"`
-	Account string     `json:"acc"`
-	User    string     `json:"user,omitempty"`
-	Name    string     `json:"name,omitempty"`
-	Lang    string     `json:"lang,omitempty"`
-	Version string     `json:"ver,omitempty"`
-	RTT     string     `json:"rtt,omitempty"`
-	Server  string     `json:"server,omitempty"`
-	Stop    *time.Time `json:"stop,omitempty"`
+	Start   *time.Time    `json:"start,omitempty"`
+	Host    string        `json:"host,omitempty"`
+	ID      uint64        `json:"id,omitempty"`
+	Account string        `json:"acc"`
+	User    string        `json:"user,omitempty"`
+	Name    string        `json:"name,omitempty"`
+	Lang    string        `json:"lang,omitempty"`
+	Version string        `json:"ver,omitempty"`
+	RTT     time.Duration `json:"rtt,omitempty"`
+	Server  string        `json:"server,omitempty"`
+	Stop    *time.Time    `json:"stop,omitempty"`
 }
 
 // ServerStats hold various statistics that we will periodically send out.
@@ -559,7 +557,7 @@ func (s *Server) startRemoteServerSweepTimer() {
 }
 
 // Length of our system hash used for server targeted messages.
-const sysHashLen = 6
+const sysHashLen = 8
 
 // This will setup our system wide tracking subs.
 // For now we will setup one wildcard subscription to
@@ -572,9 +570,7 @@ func (s *Server) initEventTracking() {
 		return
 	}
 	// Create a system hash which we use for other servers to target us specifically.
-	sha := sha256.New()
-	sha.Write([]byte(s.info.ID))
-	s.sys.shash = base64.RawURLEncoding.EncodeToString(sha.Sum(nil))[:sysHashLen]
+	s.sys.shash = string(getHash(s.info.Name))
 
 	// This will be for all inbox responses.
 	subject := fmt.Sprintf(inboxRespSubj, s.sys.shash, "*")
@@ -1251,7 +1247,7 @@ func (s *Server) accountConnectEvent(c *client) {
 			Time: time.Now().UTC(),
 		},
 		Client: ClientInfo{
-			Start:   c.start,
+			Start:   &c.start,
 			Host:    c.host,
 			ID:      c.cid,
 			Account: accForClient(c),
@@ -1294,7 +1290,7 @@ func (s *Server) accountDisconnectEvent(c *client, now time.Time, reason string)
 			Time: now.UTC(),
 		},
 		Client: ClientInfo{
-			Start:   c.start,
+			Start:   &c.start,
 			Stop:    &now,
 			Host:    c.host,
 			ID:      c.cid,
@@ -1339,7 +1335,7 @@ func (s *Server) sendAuthErrorEvent(c *client) {
 			Time: now.UTC(),
 		},
 		Client: ClientInfo{
-			Start:   c.start,
+			Start:   &c.start,
 			Stop:    &now,
 			Host:    c.host,
 			ID:      c.cid,
@@ -1572,7 +1568,7 @@ func totalSubs(rr *SublistResult, qg []byte) (nsubs int32) {
 
 // Allows users of large systems to debug active subscribers for a given subject.
 // Payload should be the subject of interest.
-func (s *Server) debugSubscribers(sub *subscription, c *client, subject, reply string, msg []byte) {
+func (s *Server) debugSubscribers(sub *subscription, c *client, subject, reply string, rmsg []byte) {
 	// Even though this is an internal only subscription, meaning interest was not forwarded, we could
 	// get one here from a GW in optimistic mode. Ignore for now.
 	// FIXME(dlc) - Should we send no interest here back to the GW?
@@ -1580,12 +1576,15 @@ func (s *Server) debugSubscribers(sub *subscription, c *client, subject, reply s
 		return
 	}
 
-	var nsubs int32
+	_, acc, _, msg, err := s.getRequestInfo(c, rmsg)
+	if err != nil {
+		return
+	}
 
 	// We could have a single subject or we could have a subject and a wildcard separated by whitespace.
 	args := strings.Split(strings.TrimSpace(string(msg)), " ")
 	if len(args) == 0 {
-		s.sendInternalAccountMsg(c.acc, reply, 0)
+		s.sendInternalAccountMsg(acc, reply, 0)
 		return
 	}
 
@@ -1595,15 +1594,17 @@ func (s *Server) debugSubscribers(sub *subscription, c *client, subject, reply s
 		qgroup = []byte(args[1])
 	}
 
+	var nsubs int32
+
 	if subjectIsLiteral(tsubj) {
 		// We will look up subscribers locally first then determine if we need to solicit other servers.
-		rr := c.acc.sl.Match(tsubj)
+		rr := acc.sl.Match(tsubj)
 		nsubs = totalSubs(rr, qgroup)
 	} else {
 		// We have a wildcard, so this is a bit slower path.
 		var _subs [32]*subscription
 		subs := _subs[:0]
-		c.acc.sl.All(&subs)
+		acc.sl.All(&subs)
 		for _, sub := range subs {
 			if subjectIsSubsetMatch(string(sub.subject), tsubj) {
 				if qgroup != nil && !bytes.Equal(qgroup, sub.queue) {
@@ -1617,7 +1618,7 @@ func (s *Server) debugSubscribers(sub *subscription, c *client, subject, reply s
 	}
 
 	// We should have an idea of how many responses to expect from remote servers.
-	var expected = c.acc.expectedRemoteResponses()
+	var expected = acc.expectedRemoteResponses()
 
 	// If we are only local, go ahead and return.
 	if expected == 0 {
@@ -1647,7 +1648,7 @@ func (s *Server) debugSubscribers(sub *subscription, c *client, subject, reply s
 	}
 	// Send the request to the other servers.
 	request := &accNumSubsReq{
-		Account: c.acc.Name,
+		Account: acc.Name,
 		Subject: tsubj,
 		Queue:   qgroup,
 	}

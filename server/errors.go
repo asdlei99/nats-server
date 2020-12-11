@@ -184,6 +184,12 @@ var (
 
 	// ErrJetStreamNotEnabledForAccount is returned JetStream is not enabled for this account.
 	ErrJetStreamNotEnabledForAccount = errors.New("jetstream not enabled for account")
+
+	// ErrJetStreamNotLeader is returned when issuing commands to a cluster on the wrong server.
+	ErrJetStreamNotLeader = errors.New("jetstream cluster can not handle request")
+
+	// ErrJetStreamNotAssigned is returned when the resource (stream or consumer) is not assigned.
+	ErrJetStreamNotAssigned = errors.New("jetstream cluster not assigned to this server")
 )
 
 // configErr is a configuration error.

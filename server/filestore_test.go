@@ -34,7 +34,7 @@ import (
 
 func TestFileStoreBasics(t *testing.T) {
 	storeDir, _ := ioutil.TempDir("", JetStreamStoreDir)
-	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	fs, _, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -100,7 +100,7 @@ func TestFileStoreBasics(t *testing.T) {
 
 func TestFileStoreMsgHeaders(t *testing.T) {
 	storeDir, _ := ioutil.TempDir("", JetStreamStoreDir)
-	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	fs, _, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -134,14 +134,14 @@ func TestFileStoreBasicWriteMsgsAndRestore(t *testing.T) {
 
 	fcfg := FileStoreConfig{StoreDir: storeDir}
 
-	if _, err := newFileStore(fcfg, StreamConfig{Storage: MemoryStorage}); err == nil {
+	if _, _, err := newFileStore(fcfg, StreamConfig{Storage: MemoryStorage}); err == nil {
 		t.Fatalf("Expected an error with wrong type")
 	}
-	if _, err := newFileStore(fcfg, StreamConfig{Storage: FileStorage}); err == nil {
+	if _, _, err := newFileStore(fcfg, StreamConfig{Storage: FileStorage}); err == nil {
 		t.Fatalf("Expected an error with no name")
 	}
 
-	fs, err := newFileStore(fcfg, StreamConfig{Name: "dlc", Storage: FileStorage})
+	fs, _, err := newFileStore(fcfg, StreamConfig{Name: "dlc", Storage: FileStorage})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -178,7 +178,7 @@ func TestFileStoreBasicWriteMsgsAndRestore(t *testing.T) {
 	}
 
 	// Restart
-	fs, err = newFileStore(fcfg, StreamConfig{Name: "dlc", Storage: FileStorage})
+	fs, _, err = newFileStore(fcfg, StreamConfig{Name: "dlc", Storage: FileStorage})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -211,7 +211,7 @@ func TestFileStoreBasicWriteMsgsAndRestore(t *testing.T) {
 	fs.Stop()
 
 	// Restart
-	fs, err = newFileStore(fcfg, StreamConfig{Name: "dlc", Storage: FileStorage})
+	fs, _, err = newFileStore(fcfg, StreamConfig{Name: "dlc", Storage: FileStorage})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -228,7 +228,7 @@ func TestFileStoreBasicWriteMsgsAndRestore(t *testing.T) {
 	fs.Purge()
 	fs.Stop()
 
-	fs, err = newFileStore(fcfg, StreamConfig{Name: "dlc", Storage: FileStorage})
+	fs, _, err = newFileStore(fcfg, StreamConfig{Name: "dlc", Storage: FileStorage})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -249,7 +249,7 @@ func TestFileStoreBasicWriteMsgsAndRestore(t *testing.T) {
 	fs.RemoveMsg(seq)
 
 	fs.Stop()
-	fs, err = newFileStore(fcfg, StreamConfig{Name: "dlc", Storage: FileStorage})
+	fs, _, err = newFileStore(fcfg, StreamConfig{Name: "dlc", Storage: FileStorage})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -266,7 +266,7 @@ func TestFileStoreSelectNextFirst(t *testing.T) {
 	os.MkdirAll(storeDir, 0755)
 	defer os.RemoveAll(storeDir)
 
-	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir, BlockSize: 256}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	fs, _, err := newFileStore(FileStoreConfig{StoreDir: storeDir, BlockSize: 256}, StreamConfig{Name: "zzz", Storage: FileStorage})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -306,7 +306,7 @@ func TestFileStoreSkipMsg(t *testing.T) {
 	os.MkdirAll(storeDir, 0755)
 	defer os.RemoveAll(storeDir)
 
-	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir, BlockSize: 256}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	fs, _, err := newFileStore(FileStoreConfig{StoreDir: storeDir, BlockSize: 256}, StreamConfig{Name: "zzz", Storage: FileStorage})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -341,7 +341,7 @@ func TestFileStoreSkipMsg(t *testing.T) {
 	// Make sure we recover same state.
 	fs.Stop()
 
-	fs, err = newFileStore(FileStoreConfig{StoreDir: storeDir, BlockSize: 256}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	fs, _, err = newFileStore(FileStoreConfig{StoreDir: storeDir, BlockSize: 256}, StreamConfig{Name: "zzz", Storage: FileStorage})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -375,7 +375,7 @@ func TestFileStoreSkipMsg(t *testing.T) {
 	// Make sure we recover same state.
 	fs.Stop()
 
-	fs, err = newFileStore(FileStoreConfig{StoreDir: storeDir, BlockSize: 256}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	fs, _, err = newFileStore(FileStoreConfig{StoreDir: storeDir, BlockSize: 256}, StreamConfig{Name: "zzz", Storage: FileStorage})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -396,7 +396,7 @@ func TestFileStoreWriteExpireWrite(t *testing.T) {
 	defer os.RemoveAll(storeDir)
 
 	cexp := 10 * time.Millisecond
-	fs, err := newFileStore(
+	fs, _, err := newFileStore(
 		FileStoreConfig{StoreDir: storeDir, BlockSize: 256, CacheExpire: cexp},
 		StreamConfig{Name: "zzz", Storage: FileStorage},
 	)
@@ -429,7 +429,7 @@ func TestFileStoreWriteExpireWrite(t *testing.T) {
 	// Make sure we recover same state.
 	fs.Stop()
 
-	fs, err = newFileStore(FileStoreConfig{StoreDir: storeDir, BlockSize: 256}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	fs, _, err = newFileStore(FileStoreConfig{StoreDir: storeDir, BlockSize: 256}, StreamConfig{Name: "zzz", Storage: FileStorage})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -460,7 +460,7 @@ func TestFileStoreMsgLimit(t *testing.T) {
 	os.MkdirAll(storeDir, 0755)
 	defer os.RemoveAll(storeDir)
 
-	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage, MaxMsgs: 10})
+	fs, _, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage, MaxMsgs: 10})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -504,7 +504,7 @@ func TestFileStoreBytesLimit(t *testing.T) {
 	os.MkdirAll(storeDir, 0755)
 	defer os.RemoveAll(storeDir)
 
-	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage, MaxBytes: int64(maxBytes)})
+	fs, _, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage, MaxBytes: int64(maxBytes)})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -549,7 +549,7 @@ func TestFileStoreAgeLimit(t *testing.T) {
 	os.MkdirAll(storeDir, 0755)
 	defer os.RemoveAll(storeDir)
 
-	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage, MaxAge: maxAge})
+	fs, _, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage, MaxAge: maxAge})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -596,7 +596,7 @@ func TestFileStoreTimeStamps(t *testing.T) {
 	os.MkdirAll(storeDir, 0755)
 	defer os.RemoveAll(storeDir)
 
-	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	fs, _, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -627,7 +627,7 @@ func TestFileStorePurge(t *testing.T) {
 	defer os.RemoveAll(storeDir)
 
 	blkSize := uint64(64 * 1024)
-	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir, BlockSize: blkSize}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	fs, _, err := newFileStore(FileStoreConfig{StoreDir: storeDir, BlockSize: blkSize}, StreamConfig{Name: "zzz", Storage: FileStorage})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -680,7 +680,7 @@ func TestFileStorePurge(t *testing.T) {
 	// Make sure we recover same state.
 	fs.Stop()
 
-	fs, err = newFileStore(FileStoreConfig{StoreDir: storeDir, BlockSize: blkSize}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	fs, _, err = newFileStore(FileStoreConfig{StoreDir: storeDir, BlockSize: blkSize}, StreamConfig{Name: "zzz", Storage: FileStorage})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -719,7 +719,7 @@ func TestFileStorePurge(t *testing.T) {
 	purgeDir := path.Join(fs.fcfg.StoreDir, purgeDir)
 	os.Rename(pdir, purgeDir)
 
-	fs, err = newFileStore(FileStoreConfig{StoreDir: storeDir, BlockSize: blkSize}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	fs, _, err = newFileStore(FileStoreConfig{StoreDir: storeDir, BlockSize: blkSize}, StreamConfig{Name: "zzz", Storage: FileStorage})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -744,7 +744,7 @@ func TestFileStoreCompact(t *testing.T) {
 	os.MkdirAll(storeDir, 0755)
 	defer os.RemoveAll(storeDir)
 
-	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	fs, _, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -778,7 +778,7 @@ func TestFileStoreRemovePartialRecovery(t *testing.T) {
 	os.MkdirAll(storeDir, 0755)
 	defer os.RemoveAll(storeDir)
 
-	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	fs, _, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -807,7 +807,7 @@ func TestFileStoreRemovePartialRecovery(t *testing.T) {
 	// Make sure we recover same state.
 	fs.Stop()
 
-	fs, err = newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	fs, _, err = newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -824,7 +824,7 @@ func TestFileStoreRemoveOutOfOrderRecovery(t *testing.T) {
 	os.MkdirAll(storeDir, 0755)
 	defer os.RemoveAll(storeDir)
 
-	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	fs, _, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -864,7 +864,7 @@ func TestFileStoreRemoveOutOfOrderRecovery(t *testing.T) {
 	// Make sure we recover same state.
 	fs.Stop()
 
-	fs, err = newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	fs, _, err = newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -892,7 +892,7 @@ func TestFileStoreAgeLimitRecovery(t *testing.T) {
 	os.MkdirAll(storeDir, 0755)
 	defer os.RemoveAll(storeDir)
 
-	fs, err := newFileStore(
+	fs, _, err := newFileStore(
 		FileStoreConfig{StoreDir: storeDir, CacheExpire: 1 * time.Millisecond},
 		StreamConfig{Name: "zzz", Storage: FileStorage, MaxAge: maxAge},
 	)
@@ -913,7 +913,7 @@ func TestFileStoreAgeLimitRecovery(t *testing.T) {
 	}
 	fs.Stop()
 
-	fs, err = newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage, MaxAge: maxAge})
+	fs, _, err = newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage, MaxAge: maxAge})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -938,7 +938,7 @@ func TestFileStoreBitRot(t *testing.T) {
 	os.MkdirAll(storeDir, 0755)
 	defer os.RemoveAll(storeDir)
 
-	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	fs, _, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -984,7 +984,7 @@ func TestFileStoreBitRot(t *testing.T) {
 	// Make sure we can restore.
 	fs.Stop()
 
-	fs, err = newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	fs, _, err = newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -1000,7 +1000,7 @@ func TestFileStoreEraseMsg(t *testing.T) {
 	os.MkdirAll(storeDir, 0755)
 	defer os.RemoveAll(storeDir)
 
-	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	fs, _, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -1059,7 +1059,7 @@ func TestFileStoreEraseAndNoIndexRecovery(t *testing.T) {
 	os.MkdirAll(storeDir, 0755)
 	defer os.RemoveAll(storeDir)
 
-	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	fs, _, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -1091,7 +1091,7 @@ func TestFileStoreEraseAndNoIndexRecovery(t *testing.T) {
 	ifn := path.Join(storeDir, msgDir, fmt.Sprintf(indexScan, 1))
 	os.Remove(ifn)
 
-	fs, err = newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	fs, _, err = newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -1116,7 +1116,7 @@ func TestFileStoreMeta(t *testing.T) {
 
 	mconfig := StreamConfig{Name: "ZZ-22-33", Storage: FileStorage, Subjects: []string{"foo.*"}, Replicas: 22}
 
-	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, mconfig)
+	fs, _, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, mconfig)
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -1210,7 +1210,7 @@ func TestFileStoreWriteAndReadSameBlock(t *testing.T) {
 	os.MkdirAll(storeDir, 0755)
 	defer os.RemoveAll(storeDir)
 
-	fs, err := newFileStore(
+	fs, _, err := newFileStore(
 		FileStoreConfig{StoreDir: storeDir},
 		StreamConfig{Name: "zzz", Storage: FileStorage},
 	)
@@ -1237,7 +1237,7 @@ func TestFileStoreAndRetrieveMultiBlock(t *testing.T) {
 	subj, msg := "foo", []byte("Hello World!")
 	storedMsgSize := fileStoreMsgSize(subj, nil, msg)
 
-	fs, err := newFileStore(
+	fs, _, err := newFileStore(
 		FileStoreConfig{StoreDir: storeDir, BlockSize: 4 * storedMsgSize},
 		StreamConfig{Name: "zzz", Storage: FileStorage},
 	)
@@ -1254,7 +1254,7 @@ func TestFileStoreAndRetrieveMultiBlock(t *testing.T) {
 	}
 	fs.Stop()
 
-	fs, err = newFileStore(
+	fs, _, err = newFileStore(
 		FileStoreConfig{StoreDir: storeDir, BlockSize: 4 * storedMsgSize},
 		StreamConfig{Name: "zzz", Storage: FileStorage},
 	)
@@ -1278,7 +1278,7 @@ func TestFileStoreCollapseDmap(t *testing.T) {
 	subj, msg := "foo", []byte("Hello World!")
 	storedMsgSize := fileStoreMsgSize(subj, nil, msg)
 
-	fs, err := newFileStore(
+	fs, _, err := newFileStore(
 		FileStoreConfig{StoreDir: storeDir, BlockSize: 4 * storedMsgSize},
 		StreamConfig{Name: "zzz", Storage: FileStorage},
 	)
@@ -1353,7 +1353,7 @@ func TestFileStoreReadCache(t *testing.T) {
 	os.MkdirAll(storeDir, 0755)
 	defer os.RemoveAll(storeDir)
 
-	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir, CacheExpire: 100 * time.Millisecond}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	fs, _, err := newFileStore(FileStoreConfig{StoreDir: storeDir, CacheExpire: 100 * time.Millisecond}, StreamConfig{Name: "zzz", Storage: FileStorage})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -1407,7 +1407,7 @@ func TestFileStorePartialCacheExpiration(t *testing.T) {
 
 	cexp := 10 * time.Millisecond
 
-	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir, CacheExpire: cexp}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	fs, _, err := newFileStore(FileStoreConfig{StoreDir: storeDir, CacheExpire: cexp}, StreamConfig{Name: "zzz", Storage: FileStorage})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -1433,7 +1433,7 @@ func TestFileStorePartialIndexes(t *testing.T) {
 
 	cexp := 10 * time.Millisecond
 
-	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir, CacheExpire: cexp}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	fs, _, err := newFileStore(FileStoreConfig{StoreDir: storeDir, CacheExpire: cexp}, StreamConfig{Name: "zzz", Storage: FileStorage})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -1481,7 +1481,7 @@ func TestFileStoreSnapshot(t *testing.T) {
 
 	subj, msg := "foo", []byte("Hello Snappy!")
 
-	fs, err := newFileStore(
+	fs, _, err := newFileStore(
 		FileStoreConfig{StoreDir: storeDir},
 		StreamConfig{Name: "zzz", Storage: FileStorage},
 	)
@@ -1568,7 +1568,7 @@ func TestFileStoreSnapshot(t *testing.T) {
 			fd.Close()
 		}
 
-		fsr, err := newFileStore(
+		fsr, _, err := newFileStore(
 			FileStoreConfig{StoreDir: rstoreDir},
 			StreamConfig{Name: "zzz", Storage: FileStorage},
 		)
@@ -1658,7 +1658,7 @@ func TestFileStoreConsumer(t *testing.T) {
 	os.MkdirAll(storeDir, 0755)
 	defer os.RemoveAll(storeDir)
 
-	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	fs, _, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -1793,7 +1793,7 @@ func TestFileStorePerf(t *testing.T) {
 	os.MkdirAll(storeDir, 0755)
 	defer os.RemoveAll(storeDir)
 
-	fs, err := newFileStore(
+	fs, _, err := newFileStore(
 		FileStoreConfig{StoreDir: storeDir},
 		StreamConfig{Name: "zzz", Storage: FileStorage},
 	)
@@ -1817,7 +1817,7 @@ func TestFileStorePerf(t *testing.T) {
 
 	fmt.Printf("Restoring..\n")
 	start = time.Now()
-	fs, err = newFileStore(
+	fs, _, err = newFileStore(
 		FileStoreConfig{StoreDir: storeDir},
 		StreamConfig{Name: "zzz", Storage: FileStorage},
 	)
@@ -1865,7 +1865,7 @@ func TestFileStorePerf(t *testing.T) {
 
 	fs.Stop()
 
-	fs, err = newFileStore(
+	fs, _, err = newFileStore(
 		FileStoreConfig{StoreDir: storeDir},
 		StreamConfig{Name: "zzz", Storage: FileStorage},
 	)
@@ -1892,7 +1892,7 @@ func TestFileStorePerf(t *testing.T) {
 	fmt.Printf("%.0f msgs/sec\n", float64(toStore)/tt.Seconds())
 	fmt.Printf("%s per sec\n", FriendlyBytes(int64(float64(toStore*storedMsgSize)/tt.Seconds())))
 
-	fs, err = newFileStore(
+	fs, _, err = newFileStore(
 		FileStoreConfig{StoreDir: storeDir},
 		StreamConfig{Name: "zzz", Storage: FileStorage},
 	)
@@ -1933,7 +1933,7 @@ func TestFileStoreReadBackMsgPerf(t *testing.T) {
 	defer os.RemoveAll(storeDir)
 	fmt.Printf("StoreDir is %q\n", storeDir)
 
-	fs, err := newFileStore(
+	fs, _, err := newFileStore(
 		FileStoreConfig{StoreDir: storeDir},
 		StreamConfig{Name: "zzz", Storage: FileStorage},
 	)
@@ -1983,7 +1983,7 @@ func TestFileStoreStoreLimitRemovePerf(t *testing.T) {
 	os.MkdirAll(storeDir, 0755)
 	defer os.RemoveAll(storeDir)
 
-	fs, err := newFileStore(
+	fs, _, err := newFileStore(
 		FileStoreConfig{StoreDir: storeDir},
 		StreamConfig{Name: "zzz", Storage: FileStorage},
 	)
@@ -2040,7 +2040,7 @@ func TestFileStorePubPerfWithSmallBlkSize(t *testing.T) {
 	os.MkdirAll(storeDir, 0755)
 	defer os.RemoveAll(storeDir)
 
-	fs, err := newFileStore(
+	fs, _, err := newFileStore(
 		FileStoreConfig{StoreDir: storeDir, BlockSize: FileStoreMinBlkSize},
 		StreamConfig{Name: "zzz", Storage: FileStorage},
 	)
@@ -2066,7 +2066,7 @@ func TestFileStoreConsumerRedeliveredLost(t *testing.T) {
 	os.MkdirAll(storeDir, 0755)
 	defer os.RemoveAll(storeDir)
 
-	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	fs, _, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -2133,7 +2133,7 @@ func TestFileStoreConsumerFlusher(t *testing.T) {
 	os.MkdirAll(storeDir, 0755)
 	defer os.RemoveAll(storeDir)
 
-	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	fs, _, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -2168,7 +2168,7 @@ func TestFileStoreConsumerDeliveredUpdates(t *testing.T) {
 	os.MkdirAll(storeDir, 0755)
 	defer os.RemoveAll(storeDir)
 
-	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	fs, _, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -2226,7 +2226,7 @@ func TestFileStoreConsumerDeliveredAndAckUpdates(t *testing.T) {
 	os.MkdirAll(storeDir, 0755)
 	defer os.RemoveAll(storeDir)
 
-	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	fs, _, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}
@@ -2346,7 +2346,7 @@ func TestFileStoreConsumerPerf(t *testing.T) {
 	os.MkdirAll(storeDir, 0755)
 	defer os.RemoveAll(storeDir)
 
-	fs, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
+	fs, _, err := newFileStore(FileStoreConfig{StoreDir: storeDir}, StreamConfig{Name: "zzz", Storage: FileStorage})
 	if err != nil {
 		t.Fatalf("Unexpected error: %v", err)
 	}

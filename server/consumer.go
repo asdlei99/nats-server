@@ -15,12 +15,10 @@ package server
 
 import (
 	"bytes"
-	"crypto/rand"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
-	mrand "math/rand"
+	"math/rand"
 	"reflect"
 	"sort"
 	"strconv"
@@ -168,9 +166,11 @@ var (
 
 // Consumer is a jetstream consumer.
 type Consumer struct {
-	mu                sync.Mutex
+	mu                sync.RWMutex
 	mset              *Stream
 	acc               *Account
+	client            *client
+	sid               int
 	name              string
 	stream            string
 	sseq              uint64
@@ -183,6 +183,7 @@ type Consumer struct {
 	reqSub            *subscription
 	ackSub            *subscription
 	ackReplyT         string
+	ackSubj           string
 	nextMsgSubj       string
 	maxp              int
 	sendq             chan *jsPubMsg
@@ -207,6 +208,7 @@ type Consumer struct {
 	deliveryExcEventT string
 	created           time.Time
 	closed            bool
+	node              RaftNode
 }
 
 const (
@@ -218,6 +220,20 @@ const (
 )
 
 func (mset *Stream) AddConsumer(config *ConsumerConfig) (*Consumer, error) {
+	return mset.addConsumer(config, _EMPTY_, nil)
+}
+
+func (mset *Stream) addConsumer(config *ConsumerConfig, oname string, node RaftNode) (*Consumer, error) {
+	mset.mu.RLock()
+	jsa := mset.jsa
+	mset.mu.RUnlock()
+
+	// If we do not have the consumer assigned to us in cluster mode we can not proceed.
+	// Running in single server mode this always returns true.
+	if oname != _EMPTY_ && !jsa.consumerAssigned(mset.Name(), oname) {
+		return nil, ErrJetStreamNotAssigned
+	}
+
 	if config == nil {
 		return nil, fmt.Errorf("consumer config required")
 	}
@@ -413,6 +429,7 @@ func (mset *Stream) AddConsumer(config *ConsumerConfig) (*Consumer, error) {
 	o := &Consumer{
 		mset:    mset,
 		acc:     a,
+		client:  s.createInternalJetStreamClient(),
 		config:  *config,
 		dsubj:   config.DeliverSubject,
 		active:  true,
@@ -432,6 +449,9 @@ func (mset *Stream) AddConsumer(config *ConsumerConfig) (*Consumer, error) {
 		if o.isPullMode() {
 			o.waiting = newWaitQueue(config.MaxWaiting)
 		}
+	} else if oname != _EMPTY_ {
+		fmt.Printf("\n\nSET EPHEMERAL CONSUMER TO OPTIONAL NAME!\n\n")
+		o.name = oname
 	} else {
 		for {
 			o.name = createConsumerName()
@@ -476,6 +496,7 @@ func (mset *Stream) AddConsumer(config *ConsumerConfig) (*Consumer, error) {
 	}
 	o.store = store
 
+	// FIXME(dlc) - Failures past this point should be consumer cleanup.
 	if !isValidName(o.name) {
 		mset.mu.Unlock()
 		return nil, fmt.Errorf("durable name can not contain '.', '*', '>'")
@@ -504,65 +525,176 @@ func (mset *Stream) AddConsumer(config *ConsumerConfig) (*Consumer, error) {
 		eo.updateDeliverSubject(o.config.DeliverSubject)
 		return eo, nil
 	}
+
 	// Set up the ack subscription for this observable. Will use wildcard for all acks.
 	// We will remember the template to generate replies with sequence numbers and use
 	// that to scanf them back in.
 	mn := mset.config.Name
 	pre := fmt.Sprintf(jsAckT, mn, o.name)
 	o.ackReplyT = fmt.Sprintf("%s.%%d.%%d.%%d.%%d.%%d", pre)
-	ackSubj := fmt.Sprintf("%s.*.*.*.*.*", pre)
-	if sub, err := mset.subscribeInternal(ackSubj, o.processAck); err != nil {
-		mset.mu.Unlock()
-		return nil, err
-	} else {
-		o.ackSub = sub
-	}
+	o.ackSubj = fmt.Sprintf("%s.*.*.*.*.*", pre)
 
-	// Setup the internal sub for next message requests.
-	if !o.isPushMode() {
+	if o.isPullMode() {
 		o.nextMsgSubj = fmt.Sprintf(JSApiRequestNextT, mn, o.name)
-		if sub, err := mset.subscribeInternal(o.nextMsgSubj, o.processNextMsgReq); err != nil {
-			mset.mu.Unlock()
-			o.deleteWithoutAdvisory()
-			return nil, err
-		} else {
-			o.reqSub = sub
+	} else {
+		o.dthresh = JsDeleteWaitTimeDefault
+		if !o.isDurable() {
+			// Check if we are not durable that the delivery subject has interest.
+			// Check in place here for interest. Will setup properly in setLeader.
+			r := o.acc.sl.Match(o.config.DeliverSubject)
+			if !o.hasDeliveryInterest(len(r.psubs)+len(r.qsubs) > 0) {
+				mset.mu.Unlock()
+				o.deleteWithoutAdvisory()
+				return nil, fmt.Errorf("consumer requires interest for delivery subject when ephemeral")
+			}
 		}
 	}
-	o.setInitialPending()
 
-	mset.addConsumer(o)
+	// Set our node.
+	o.node = node
+
+	mset.setConsumer(o)
 	mset.mu.Unlock()
 
-	// If push mode, register for notifications on interest.
-	if o.isPushMode() {
-		o.dthresh = JsDeleteWaitTimeDefault
-		o.inch = make(chan bool, 8)
-		a.sl.RegisterNotification(config.DeliverSubject, o.inch)
-		o.active = o.hasDeliveryInterest(<-o.inch)
-		// Check if we are not durable that the delivery subject has interest.
-		if !o.isDurable() && !o.active {
-			o.deleteWithoutAdvisory()
-			return nil, fmt.Errorf("consumer requires interest for delivery subject when ephemeral")
-		}
+	if !s.JetStreamIsClustered() {
+		o.setLeader(true)
 	}
 
-	// If we are not in ReplayInstant mode mark us as in replay state until resolved.
-	if config.ReplayPolicy != ReplayInstant {
-		o.replay = true
+	// This is always true in single server mode.
+	if o.isLeader() {
+		// Send advisory.
+		o.sendCreateAdvisory()
 	}
-
-	// Create internal sendq
-	o.sendq = make(chan *jsPubMsg, msetSendQSize)
-
-	// Now start up Go routine to deliver msgs.
-	go o.loopAndGatherMsgs(s, a)
-	// Startup our deliver loop.
-	go o.loopAndDeliverMsgs()
-
-	o.sendCreateAdvisory()
 
 	return o, nil
+}
+
+// Lock should be held.
+func (o *Consumer) isLeader() bool {
+	if o.node != nil {
+		return o.node.Leader()
+	}
+	return true
+}
+
+func (o *Consumer) setLeader(isLeader bool) {
+	o.mu.RLock()
+	mset := o.mset
+	o.mu.RUnlock()
+
+	if mset == nil {
+		return
+	}
+
+	// If we are here we have a change in leader status.
+	if isLeader {
+		fmt.Printf("[%s] - SETUP INTERNAL SUBSCRIPTION(s) for consumer %q\n\n", o.acc.srv.Name(), o.name)
+		o.mu.Lock()
+		var err error
+		if o.ackSub, err = o.subscribeInternal(o.ackSubj, o.processAck); err != nil {
+			o.mu.Unlock()
+			o.deleteWithoutAdvisory()
+			return
+		}
+		// Setup the internal sub for next message requests.
+		if !o.isPushMode() {
+			//o.nextMsgSubj = fmt.Sprintf(JSApiRequestNextT, mn, o.name)
+			if o.reqSub, err = o.subscribeInternal(o.nextMsgSubj, o.processNextMsgReq); err != nil {
+				o.mu.Unlock()
+				o.deleteWithoutAdvisory()
+				return
+			}
+		}
+		// Setup initial pending.
+		o.setInitialPending()
+
+		// If push mode, register for notifications on interest.
+		if o.isPushMode() {
+			o.inch = make(chan bool, 8)
+			o.acc.sl.RegisterNotification(o.config.DeliverSubject, o.inch)
+			o.active = <-o.inch
+		}
+
+		// If we are not in ReplayInstant mode mark us as in replay state until resolved.
+		if o.config.ReplayPolicy != ReplayInstant {
+			o.replay = true
+		}
+
+		// Create internal sendq
+		o.sendq = make(chan *jsPubMsg, msetSendQSize)
+		o.mu.Unlock()
+
+		// Now start up Go routine to deliver msgs.
+		go o.loopAndGatherMsgs()
+		// Startup our deliver loop.
+		go o.loopAndDeliverMsgs()
+
+	} else {
+		// Shutdown the go routines and the subscriptions.
+		o.mu.Lock()
+		if o.ackSub == nil {
+			fmt.Printf("[%s] - Consumer setLeader(false) but was not running yet!\n", o.acc.srv.Name())
+			o.mu.Unlock()
+			return
+		}
+		o.mu.Unlock()
+	}
+}
+
+// Lock should be held.
+func (o *Consumer) subscribeInternal(subject string, cb msgHandler) (*subscription, error) {
+	c := o.client
+	if c == nil {
+		return nil, fmt.Errorf("invalid consumer")
+	}
+	if !c.srv.eventsEnabled() {
+		return nil, ErrNoSysAccount
+	}
+	if cb == nil {
+		return nil, fmt.Errorf("undefined message handler")
+	}
+
+	o.sid++
+
+	// Now create the subscription
+	return c.processSub([]byte(subject), nil, []byte(strconv.Itoa(o.sid)), cb, false)
+}
+
+// This will unsubscribe us from the exact subject given.
+// We do not currently track the subs so do not have the sid.
+// This should be called only on an update.
+// Lock should be held.
+func (o *Consumer) unsubscribeInternal(subject string) error {
+	c := o.client
+	if c == nil {
+		return fmt.Errorf("invalid consumer")
+	}
+	if !c.srv.eventsEnabled() {
+		return ErrNoSysAccount
+	}
+
+	var sid []byte
+
+	c.mu.Lock()
+	for _, sub := range c.subs {
+		if subject == string(sub.subject) {
+			sid = sub.sid
+			break
+		}
+	}
+	c.mu.Unlock()
+
+	if sid != nil {
+		return c.processUnsub(sid)
+	}
+	return nil
+}
+
+func (o *Consumer) account() *Account {
+	o.mu.RLock()
+	a := o.acc
+	o.mu.RUnlock()
+	return a
 }
 
 // We need to make sure we protect access to the sendq.
@@ -768,7 +900,8 @@ func (o *Consumer) sendAckReply(subj string) {
 }
 
 // Process a message for the ack reply subject delivered with a message.
-func (o *Consumer) processAck(_ *subscription, _ *client, subject, reply string, msg []byte) {
+func (o *Consumer) processAck(_ *subscription, c *client, subject, reply string, rmsg []byte) {
+	_, msg := c.msgParts(rmsg)
 	sseq, dseq, dc := ackReplyInfo(subject)
 
 	skipAckReply := sseq == 0
@@ -1035,7 +1168,7 @@ func (o *Consumer) shouldSample() bool {
 
 	// TODO(ripienaar) this is a tad slow so we need to rethink here, however this will only
 	// hit for those with sampling enabled and its not the default
-	return mrand.Int31n(100) <= o.sfreq
+	return rand.Int31n(100) <= o.sfreq
 }
 
 func (o *Consumer) sampleAck(sseq, dseq, dc uint64) {
@@ -1413,7 +1546,7 @@ var errBadConsumer = errors.New("consumer not valid")
 // Is partition aware and redeliver aware.
 // Lock should be held.
 func (o *Consumer) getNextMsg() (subj string, hdr, msg []byte, seq uint64, dc uint64, ts int64, err error) {
-	if o.mset == nil {
+	if o.mset == nil || o.mset.store == nil {
 		return _EMPTY_, nil, nil, 0, 0, 0, errBadConsumer
 	}
 	for {
@@ -1503,7 +1636,7 @@ func (o *Consumer) checkWaitingForInterest() bool {
 	return o.waiting.len() > 0
 }
 
-func (o *Consumer) loopAndGatherMsgs(s *Server, a *Account) {
+func (o *Consumer) loopAndGatherMsgs() {
 	// On startup check to see if we are in a a reply situtation where replay policy is not instant.
 	var (
 		lts  int64 // last time stamp seen, used for replay.
@@ -2011,15 +2144,8 @@ func (o *Consumer) Name() string {
 	return n
 }
 
-// For now size of 6 for randomly created names.
-const randConsumerNameLen = 6
-
 func createConsumerName() string {
-	var b [256]byte
-	rand.Read(b[:])
-	sha := sha256.New()
-	sha.Write(b[:])
-	return fmt.Sprintf("%x", sha.Sum(nil))[:randConsumerNameLen]
+	return string(getHash(nuid.Next()))
 }
 
 // DeleteConsumer will delete the consumer from this stream.
@@ -2129,6 +2255,7 @@ func (o *Consumer) stop(dflag, doSignal, advisory bool) error {
 	if doSignal {
 		o.signalNewMessages()
 	}
+	n := o.node
 	o.mu.Unlock()
 
 	if delivery != "" {
@@ -2160,6 +2287,10 @@ func (o *Consumer) stop(dflag, doSignal, advisory bool) error {
 				mset.store.RemoveMsg(seq)
 			}
 		}
+	}
+
+	if dflag && n != nil {
+		n.Stop()
 	}
 
 	var err error

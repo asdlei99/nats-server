@@ -59,6 +59,8 @@ type leaf struct {
 	isSpoke bool
 	// remoteCluster is when we are a hub but the spoke leafnode is part of a cluster.
 	remoteCluster string
+	// remoteServer holds onto the remove server's name or ID.
+	remoteServer string
 	// Used to suppress sub and unsub interest. Same as routes but our audience
 	// here is tied to this leaf node. This will hold all subscriptions except this
 	// leaf nodes. This represents all the interest we want to send to the other side.
@@ -423,6 +425,7 @@ func (s *Server) startLeafNodeAcceptLoop() {
 	tlsVerify := tlsRequired && opts.LeafNode.TLSConfig.ClientAuth == tls.RequireAndVerifyClientCert
 	info := Info{
 		ID:           s.info.ID,
+		Name:         s.info.Name,
 		Version:      s.info.Version,
 		GitCommit:    gitCommit,
 		GoVersion:    runtime.Version(),
@@ -483,7 +486,8 @@ func (c *client) sendLeafConnect(clusterName string, tlsRequired bool) error {
 	// We support basic user/pass and operator based user JWT with signatures.
 	cinfo := leafConnectInfo{
 		TLS:     tlsRequired,
-		Name:    c.srv.info.ID,
+		ID:      c.srv.info.ID,
+		Name:    c.srv.info.Name,
 		Hub:     c.leaf.remote.Hub,
 		Cluster: clusterName,
 	}
@@ -954,6 +958,9 @@ func (c *client) processLeafnodeInfo(info *Info) error {
 		}
 		supportsHeaders := c.srv.supportsHeaders()
 		c.headers = supportsHeaders && info.Headers
+
+		// Remember the remote server.
+		c.leaf.remoteServer = info.Name
 	}
 	// For both initial INFO and async INFO protocols, Possibly
 	// update our list of remote leafnode URLs we can connect to.
@@ -1083,7 +1090,7 @@ func (s *Server) addLeafNodeConnection(c *client, srvName string, checkForDup bo
 		for _, ol := range s.leafs {
 			ol.mu.Lock()
 			// We check for empty because in some test we may send empty CONNECT{}
-			if srvName != _EMPTY_ && ol.opts.Name == srvName && ol.acc.Name == accName {
+			if srvName != _EMPTY_ && ol.leaf.remoteServer == srvName && ol.acc.Name == accName {
 				old = ol
 			}
 			ol.mu.Unlock()
@@ -1126,7 +1133,8 @@ type leafConnectInfo struct {
 	Pass    string `json:"pass,omitempty"`
 	TLS     bool   `json:"tls_required"`
 	Comp    bool   `json:"compression,omitempty"`
-	Name    string `json:"name,omitempty"`
+	ID      string `json:"server_id,omitempty"`
+	Name    string `json:"server_name,omitempty"`
 	Hub     bool   `json:"is_hub,omitempty"`
 	Cluster string `json:"cluster,omitempty"`
 
@@ -1168,6 +1176,9 @@ func (c *client) processLeafNodeConnect(s *Server, arg []byte, lang string) erro
 	c.opts.Echo = false
 	c.opts.Pedantic = false
 
+	// Remember the remote server.
+	c.leaf.remoteServer = proto.Name
+
 	// If the other side has declared itself a hub, so we will take on the spoke role.
 	if proto.Hub {
 		c.leaf.isSpoke = true
@@ -1200,7 +1211,7 @@ func (c *client) processLeafNodeConnect(s *Server, arg []byte, lang string) erro
 // Returns the remote cluster name. This is set only once so does not require a lock.
 func (c *client) remoteCluster() string {
 	if c.leaf == nil {
-		return ""
+		return _EMPTY_
 	}
 	return c.leaf.remoteCluster
 }
@@ -1635,6 +1646,7 @@ func (c *client) handleLeafNodeLoop(sendErr bool) {
 	if sendErr {
 		c.sendErr(errTxt)
 	}
+
 	c.Errorf(errTxt)
 	// If we are here with "sendErr" false, it means that this is the server
 	// that received the error. The other side will have closed the connection,

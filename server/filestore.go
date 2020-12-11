@@ -244,23 +244,23 @@ const (
 	FileStoreMaxBlkSize = maxBlockSize
 )
 
-func newFileStore(fcfg FileStoreConfig, cfg StreamConfig) (*fileStore, error) {
+func newFileStore(fcfg FileStoreConfig, cfg StreamConfig) (*fileStore, bool, error) {
 	return newFileStoreWithCreated(fcfg, cfg, time.Now())
 }
 
-func newFileStoreWithCreated(fcfg FileStoreConfig, cfg StreamConfig, created time.Time) (*fileStore, error) {
+func newFileStoreWithCreated(fcfg FileStoreConfig, cfg StreamConfig, created time.Time) (*fileStore, bool, error) {
 	if cfg.Name == "" {
-		return nil, fmt.Errorf("name required")
+		return nil, false, fmt.Errorf("name required")
 	}
 	if cfg.Storage != FileStorage {
-		return nil, fmt.Errorf("fileStore requires file storage type in config")
+		return nil, false, fmt.Errorf("fileStore requires file storage type in config")
 	}
 	// Default values.
 	if fcfg.BlockSize == 0 {
 		fcfg.BlockSize = dynBlkSize(cfg.Retention, cfg.MaxBytes)
 	}
 	if fcfg.BlockSize > maxBlockSize {
-		return nil, fmt.Errorf("filestore max block size is %s", FriendlyBytes(maxBlockSize))
+		return nil, false, fmt.Errorf("filestore max block size is %s", FriendlyBytes(maxBlockSize))
 	}
 	if fcfg.CacheExpire == 0 {
 		fcfg.CacheExpire = defaultCacheBufferExpiration
@@ -269,17 +269,21 @@ func newFileStoreWithCreated(fcfg FileStoreConfig, cfg StreamConfig, created tim
 		fcfg.SyncInterval = defaultSyncInterval
 	}
 
+	// Track if we created this vs restored.
+	var bootstrap bool
+
 	// Check the directory
 	if stat, err := os.Stat(fcfg.StoreDir); os.IsNotExist(err) {
+		bootstrap = true
 		if err := os.MkdirAll(fcfg.StoreDir, 0755); err != nil {
-			return nil, fmt.Errorf("could not create storage directory - %v", err)
+			return nil, bootstrap, fmt.Errorf("could not create storage directory - %v", err)
 		}
 	} else if stat == nil || !stat.IsDir() {
-		return nil, fmt.Errorf("store directory is not a directory")
+		return nil, bootstrap, fmt.Errorf("store directory is not a directory")
 	}
 	tmpfile, err := ioutil.TempFile(fcfg.StoreDir, "_test_")
 	if err != nil {
-		return nil, fmt.Errorf("storage directory is not writable")
+		return nil, bootstrap, fmt.Errorf("storage directory is not writable")
 	}
 	os.Remove(tmpfile.Name())
 
@@ -293,35 +297,35 @@ func newFileStoreWithCreated(fcfg FileStoreConfig, cfg StreamConfig, created tim
 	mdir := path.Join(fcfg.StoreDir, msgDir)
 	odir := path.Join(fcfg.StoreDir, consumerDir)
 	if err := os.MkdirAll(mdir, 0755); err != nil {
-		return nil, fmt.Errorf("could not create message storage directory - %v", err)
+		return nil, bootstrap, fmt.Errorf("could not create message storage directory - %v", err)
 	}
 	if err := os.MkdirAll(odir, 0755); err != nil {
-		return nil, fmt.Errorf("could not create message storage directory - %v", err)
+		return nil, bootstrap, fmt.Errorf("could not create message storage directory - %v", err)
 	}
 
 	// Create highway hash for message blocks. Use sha256 of directory as key.
 	key := sha256.Sum256([]byte(cfg.Name))
 	fs.hh, err = highwayhash.New64(key[:])
 	if err != nil {
-		return nil, fmt.Errorf("could not create hash: %v", err)
+		return nil, bootstrap, fmt.Errorf("could not create hash: %v", err)
 	}
 
 	// Recover our state.
 	if err := fs.recoverMsgs(); err != nil {
-		return nil, err
+		return nil, bootstrap, err
 	}
 
 	// Write our meta data iff does not exist.
 	meta := path.Join(fcfg.StoreDir, JetStreamMetaFile)
 	if _, err := os.Stat(meta); err != nil && os.IsNotExist(err) {
 		if err := fs.writeStreamMeta(); err != nil {
-			return nil, err
+			return nil, bootstrap, err
 		}
 	}
 
 	fs.syncTmr = time.AfterFunc(fs.fcfg.SyncInterval, fs.syncBlocks)
 
-	return fs, nil
+	return fs, bootstrap, nil
 }
 
 func (fs *fileStore) UpdateConfig(cfg *StreamConfig) error {
