@@ -1267,6 +1267,16 @@ func (s *Server) jsStreamPurgeRequest(sub *subscription, c *client, subject, rep
 		return
 	}
 
+	stream := streamNameFromSubject(subject)
+
+	// If we are in clustered mode we need to be the stream leader to proceed.
+	if s.JetStreamIsClustered() && !acc.JetStreamIsStreamLeader(stream) {
+		fmt.Printf("[%s] Purge skipping this server, not leader!!!\n", s.Name())
+		return
+	}
+
+	fmt.Printf("[%s] Will process Purge since we are stream leader!!!\n", s.Name())
+
 	var resp = JSApiStreamPurgeResponse{ApiResponse: ApiResponse{Type: JSApiStreamPurgeResponseType}}
 	if !acc.JetStreamEnabled() {
 		resp.Error = jsNotEnabledErr
@@ -1278,13 +1288,18 @@ func (s *Server) jsStreamPurgeRequest(sub *subscription, c *client, subject, rep
 		s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
-	stream := streamNameFromSubject(subject)
 	mset, err := acc.LookupStream(stream)
 	if err != nil {
 		resp.Error = jsNotFoundError(err)
 		s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
+
+	if s.JetStreamIsClustered() {
+		s.jsClusteredStreamPurgeRequest(ci, stream, subject, reply, rmsg)
+		return
+	}
+
 	purged, err := mset.Purge()
 	if err != nil {
 		resp.Error = jsError(err)

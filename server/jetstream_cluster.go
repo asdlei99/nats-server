@@ -45,8 +45,9 @@ const (
 	assignConsumerOp
 	removeStreamOp
 	removeConsumerOp
-	// Core group operations.
+	// Stream operations.
 	streamMsgOp
+	purgeStreamOp
 )
 
 // raftGroup are controlled by the metagroup controller. The raftGroups will
@@ -68,6 +69,16 @@ type streamAssignment struct {
 	Reply  string        `json:"reply"`
 	// Internal
 	consumers map[string]*consumerAssignment
+	responded bool
+	err       error
+}
+
+// streamPurge is what the stream leader will replicate when purging a stream.
+type streamPurge struct {
+	Client *ClientInfo `json:"client,omitempty"`
+	Stream string      `json:"stream"`
+	Reply  string      `json:"reply"`
+	// Internal
 	responded bool
 	err       error
 }
@@ -213,7 +224,7 @@ func (a *Account) JetStreamIsStreamLeader(stream string) bool {
 	js.mu.RLock()
 	defer js.mu.RUnlock()
 	// FIXME(dlc) - Do groups here too.
-	return js.cluster.isStreamLeader(a, stream)
+	return js.cluster.isStreamLeader(a.Name, stream)
 }
 
 func (s *Server) jetStreamReadAllowed() bool {
@@ -341,13 +352,12 @@ func (cc *jetStreamCluster) isStreamAssigned(a *Account, stream string) bool {
 }
 
 // Read lock should be held.
-func (cc *jetStreamCluster) isStreamLeader(a *Account, stream string) bool {
+func (cc *jetStreamCluster) isStreamLeader(account, stream string) bool {
 	// Non-clustered mode always return true.
 	if cc == nil {
 		return true
 	}
-	fmt.Printf("[%s] - Checking cc.streams of %+v\n", a.srv.Name(), cc.streams)
-	as := cc.streams[a.Name]
+	as := cc.streams[account]
 	if as == nil {
 		return false
 	}
@@ -556,6 +566,31 @@ func (js *jetStream) applyStreamEntries(mset *Stream, entries [][]byte) {
 			}
 			fmt.Printf("[%s] DECODED %q %q %q %q\n\n", js.srv.Name(), subject, reply, hdr, msg)
 			mset.processJetStreamMsg(subject, reply, hdr, msg)
+		case purgeStreamOp:
+			sp, err := decodeStreamPurge(buf[1:])
+			if err != nil {
+				panic(err.Error())
+			}
+			s := js.server()
+			fmt.Printf("[%s] PURGE DECODED %+v\n\n", js.srv.Name(), sp)
+			purged, err := mset.Purge()
+			if err != nil {
+				s.Warnf("JetStream cluster failed to purge stream %q for account %q: %v", sp.Stream, sp.Client.Account, err)
+			}
+			js.mu.RLock()
+			isLeader := js.cluster.isStreamLeader(sp.Client.Account, sp.Stream)
+			js.mu.RUnlock()
+			if isLeader {
+				fmt.Printf("[%s] PURGED %d, SHOULD RESPOND AS LEADER\n\n", js.srv.Name(), purged)
+				var resp = JSApiStreamPurgeResponse{ApiResponse: ApiResponse{Type: JSApiStreamPurgeResponseType}}
+				if err != nil {
+					resp.Error = jsError(err)
+				} else {
+					resp.Purged = purged
+					resp.Success = true
+				}
+				s.sendAPIResponse(sp.Client, mset.account(), _EMPTY_, sp.Reply, _EMPTY_, s.jsonResponse(resp))
+			}
 		default:
 			panic("JetStream Cluster Unknown group entry op type!")
 		}
@@ -1175,6 +1210,40 @@ func (s *Server) jsClusteredStreamDeleteRequest(ci *ClientInfo, stream, subject,
 	fmt.Printf("OSA is %+v\n", osa)
 	sa := &streamAssignment{Group: osa.Group, Config: osa.Config, Reply: reply, Client: ci}
 	cc.meta.Propose(encodeDeleteStreamAssignment(sa))
+}
+
+func (s *Server) jsClusteredStreamPurgeRequest(ci *ClientInfo, stream, subject, reply string, rmsg []byte) {
+	fmt.Printf("[%s:%s]\tWill answer stream purge!\n", s.Name(), s.js.nodeID())
+	js, cc := s.getJetStreamCluster()
+	if js == nil || cc == nil {
+		return
+	}
+
+	js.mu.Lock()
+	defer js.mu.Unlock()
+
+	sa := js.streamAssignment(ci.Account, stream)
+	if sa == nil || sa.Group == nil || sa.Group.node == nil {
+		// TODO(dlc) - Should respond? Log?
+		return
+	}
+	n := sa.Group.node
+	fmt.Printf("SA is %+v\n", sa.Group)
+	sp := &streamPurge{Stream: stream, Reply: reply, Client: ci}
+	n.Propose(encodeStreamPurge(sp))
+}
+
+func encodeStreamPurge(sp *streamPurge) []byte {
+	var bb bytes.Buffer
+	bb.WriteByte(byte(purgeStreamOp))
+	json.NewEncoder(&bb).Encode(sp)
+	return bb.Bytes()
+}
+
+func decodeStreamPurge(buf []byte) (*streamPurge, error) {
+	var sp streamPurge
+	err := json.Unmarshal(buf, &sp)
+	return &sp, err
 }
 
 func (s *Server) jsClusteredConsumerDeleteRequest(ci *ClientInfo, stream, consumer, subject, reply string, rmsg []byte) {

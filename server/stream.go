@@ -264,6 +264,20 @@ func (mset *Stream) setLeader(isLeader bool) {
 	mset.mu.Unlock()
 }
 
+// account gets the account for this stream.
+func (mset *Stream) account() *Account {
+	mset.mu.RLock()
+	jsa := mset.jsa
+	mset.mu.RUnlock()
+	if jsa == nil {
+		return nil
+	}
+	jsa.mu.RLock()
+	acc := jsa.account
+	jsa.mu.RUnlock()
+	return acc
+}
+
 // Helper to determine the max msg size for this stream if file based.
 func (mset *Stream) maxMsgSize() uint64 {
 	maxMsgSize := mset.config.MaxMsgSize

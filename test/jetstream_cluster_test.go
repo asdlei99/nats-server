@@ -46,7 +46,6 @@ func createJetStreamClusterExplicit(t *testing.T, clusterName string, numServers
 			routes = [%s]
 		}
 	`
-
 	// Build out the routes that will be shared with all configs.
 	var routes []string
 	for cp := startClusterPort; cp < startClusterPort+numServers; cp++ {
@@ -214,8 +213,6 @@ func TestJetStreamClusterSingleReplicaStreams(t *testing.T) {
 	}
 	fmt.Printf("si is %+v\n", si)
 
-	start := time.Now()
-
 	// Send in 10 messages.
 	msg, toSend := []byte("Hello JS Clustering"), 10
 	for i := 0; i < toSend; i++ {
@@ -223,8 +220,6 @@ func TestJetStreamClusterSingleReplicaStreams(t *testing.T) {
 			t.Fatalf("Unexpected publish error: %v", err)
 		}
 	}
-	fmt.Printf("Took %v to send 10 msgs with no replicas!\n\n", time.Since(start))
-
 	fmt.Printf("\nREQUESTING STREAM INFO\n\n")
 
 	// Now grab info for this stream.
@@ -431,6 +426,61 @@ func TestJetStreamClusterDelete(t *testing.T) {
 	if info.Streams != 0 {
 		t.Fatalf("Expected no remaining streams, got %d", info.Streams)
 	}
+}
+
+func TestJetStreamClusterStreamPurge(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R5S", 5)
+	defer c.shutdown()
+
+	s := c.randomServer()
+
+	// Client based API
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo", "bar"},
+		Replicas: 3,
+	})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	msg, toSend := []byte("Hello JS Clustering"), 100
+	for i := 0; i < toSend; i++ {
+		if _, err = js.Publish("foo", msg); err != nil {
+			t.Fatalf("Unexpected publish error: %v", err)
+		}
+	}
+
+	// Now grab info for this stream.
+	si, err := js.StreamInfo("TEST")
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	// Check active state as well, shows that the owner answered.
+	if si.State.Msgs != uint64(toSend) {
+		t.Fatalf("Expected %d msgs, got bad state: %+v", toSend, si.State)
+	}
+
+	fmt.Printf("\nPURGING STREAM\n\n")
+
+	// Now purge the stream.
+	resp, _ := nc.Request(fmt.Sprintf(server.JSApiStreamPurgeT, "TEST"), nil, time.Second)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	var pResp server.JSApiStreamPurgeResponse
+	if err = json.Unmarshal(resp.Data, &pResp); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if !pResp.Success || pResp.Error != nil {
+		t.Fatalf("Got a bad response %+v", pResp)
+	}
+	if pResp.Purged != uint64(toSend) {
+		t.Fatalf("Expected %d purged, got %d", toSend, pResp.Purged)
+	}
+
 }
 
 func (c *cluster) checkClusterFormed() {
