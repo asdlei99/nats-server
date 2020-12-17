@@ -118,7 +118,7 @@ const (
 	raftVoteSubj   = "$SYS.NRG.%s.%s.V"
 	raftAppendSubj = "$SYS.NRG.%s.%s.A"
 	raftChangeSubj = "$SYS.NRG.%s.%s.C"
-	raftReplySubj  = "$SYS.NRG.%s.%s"
+	raftReplySubj  = "$SYS.NRG.%s.%s.%s"
 )
 
 func (s *Server) newRaftGroup(name, storeDir string, log WAL) (RaftNode, error) {
@@ -330,7 +330,7 @@ func (n *raft) newInbox(cn string) string {
 		b[i] = digits[l%base]
 		l /= base
 	}
-	return fmt.Sprintf(raftReplySubj, n.hash, b[:])
+	return fmt.Sprintf(raftReplySubj, n.group, n.hash, b[:])
 }
 
 func (n *raft) createInternalSubs() error {
@@ -563,11 +563,12 @@ func (n *raft) trackResponse(ar *appendEntryResponse) {
 	}
 
 	var sendHB bool
-	results := n.acks[ar.index]
-	results[ar.peer] = struct{}{}
-	if nr := len(results); nr >= n.qn {
-		n.apply(ar.index)
-		sendHB = len(n.propc) == 0
+	if results := n.acks[ar.index]; results != nil {
+		results[ar.peer] = struct{}{}
+		if nr := len(results); nr >= n.qn {
+			n.apply(ar.index)
+			sendHB = len(n.propc) == 0
+		}
 	}
 	n.Unlock()
 
@@ -603,7 +604,6 @@ func (n *raft) runAsCandidate() {
 			n.switchToCandidate()
 			return
 		case vresp := <-n.votes:
-			n.debug("VoteResponse is %+v\n", vresp)
 			if vresp.granted && n.term >= vresp.term {
 				votes++
 				n.debug("Num Votes is now %d\n", votes)

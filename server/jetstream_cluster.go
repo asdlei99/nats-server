@@ -40,14 +40,17 @@ type jetStreamCluster struct {
 type entryOp uint8
 
 const (
-	// Meta operations.
+	// Meta ops.
 	assignStreamOp entryOp = iota
 	assignConsumerOp
 	removeStreamOp
 	removeConsumerOp
-	// Stream operations.
+	// Stream ops.
 	streamMsgOp
 	purgeStreamOp
+	// Consumer ops
+	updateDeliveredOp
+	updateAcksOp
 )
 
 // raftGroup are controlled by the metagroup controller. The raftGroups will
@@ -119,11 +122,14 @@ func validateJetStreamOptions(o *Options) error {
 
 func (s *Server) getJetStreamCluster() (*jetStream, *jetStreamCluster) {
 	s.mu.Lock()
+	shutdown := s.shutdown
 	js := s.js
 	s.mu.Unlock()
-	if js == nil {
+
+	if shutdown || js == nil {
 		return nil, nil
 	}
+
 	js.mu.RLock()
 	cc := js.cluster
 	js.mu.RUnlock()
@@ -216,6 +222,14 @@ func (a *Account) jetStreamReadAllowedForStream(stream string) bool {
 	return js.cluster.isStreamAssigned(a, stream)
 }
 
+func (s *Server) JetStreamIsStreamLeader(account, stream string) bool {
+	js, cc := s.getJetStreamCluster()
+	if js == nil || cc == nil {
+		return false
+	}
+	return cc.isStreamLeader(account, stream)
+}
+
 func (a *Account) JetStreamIsStreamLeader(stream string) bool {
 	s, js, jsa := a.getJetStreamFromAccount()
 	if s == nil || js == nil || jsa == nil {
@@ -223,8 +237,25 @@ func (a *Account) JetStreamIsStreamLeader(stream string) bool {
 	}
 	js.mu.RLock()
 	defer js.mu.RUnlock()
-	// FIXME(dlc) - Do groups here too.
 	return js.cluster.isStreamLeader(a.Name, stream)
+}
+
+func (a *Account) JetStreamIsConsumerLeader(stream, consumer string) bool {
+	s, js, jsa := a.getJetStreamFromAccount()
+	if s == nil || js == nil || jsa == nil {
+		return false
+	}
+	js.mu.RLock()
+	defer js.mu.RUnlock()
+	return js.cluster.isConsumerLeader(a.Name, stream, consumer)
+}
+
+func (s *Server) JetStreamIsConsumerLeader(account, stream, consumer string) bool {
+	js, cc := s.getJetStreamCluster()
+	if js == nil || cc == nil {
+		return false
+	}
+	return cc.isConsumerLeader(account, stream, consumer)
 }
 
 func (s *Server) jetStreamReadAllowed() bool {
@@ -357,11 +388,10 @@ func (cc *jetStreamCluster) isStreamLeader(account, stream string) bool {
 	if cc == nil {
 		return true
 	}
-	as := cc.streams[account]
-	if as == nil {
-		return false
+	var sa *streamAssignment
+	if as := cc.streams[account]; as != nil {
+		sa = as[stream]
 	}
-	sa := as[stream]
 	if sa == nil {
 		return false
 	}
@@ -381,9 +411,37 @@ func (cc *jetStreamCluster) isStreamLeader(account, stream string) bool {
 	return false
 }
 
+// Read lock should be held.
+func (cc *jetStreamCluster) isConsumerLeader(account, stream, consumer string) bool {
+	// Non-clustered mode always return true.
+	if cc == nil {
+		return true
+	}
+	var sa *streamAssignment
+	if as := cc.streams[account]; as != nil {
+		sa = as[stream]
+	}
+	if sa == nil {
+		return false
+	}
+	// Check if we are the leader of this raftGroup assigned to this consumer.
+	ourID := cc.meta.ID()
+	for _, ca := range sa.consumers {
+		rg := ca.Group
+		for _, peer := range rg.Peers {
+			if peer == ourID {
+				if len(rg.Peers) == 1 || rg.node.Leader() {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 func (js *jetStream) monitorCluster() {
-	fmt.Printf("[%s] Starting monitor cluster routine\n", js.srv.Name())
-	defer fmt.Printf("[%s] Exiting monitor cluster routine\n", js.srv.Name())
+	fmt.Printf("[%s] Starting monitor cluster routine\n", js.srv)
+	defer fmt.Printf("[%s] Exiting monitor cluster routine\n", js.srv)
 
 	s, n := js.server(), js.getMetaGroup()
 	qch, lch, ach := n.QuitC(), n.LeadChangeC(), n.ApplyC()
@@ -527,8 +585,8 @@ func (mset *Stream) raftNode() RaftNode {
 }
 
 func (js *jetStream) monitorStreamRaftGroup(mset *Stream, sa *streamAssignment) {
-	fmt.Printf("[%s] Starting stream monitor raft group routine\n", sa.Group.Name)
-	defer fmt.Printf("[%s] Exiting stream monitor raft group routine\n", sa.Group.Name)
+	fmt.Printf("[%s:%s] Starting stream monitor raft group routine\n", js.srv.Name(), sa.Group.Name)
+	defer fmt.Printf("[%s:%s] Exiting stream monitor raft group routine\n", js.srv.Name(), sa.Group.Name)
 
 	s, n := js.server(), mset.raftNode()
 	if n == nil {
@@ -621,7 +679,6 @@ func (js *jetStream) processStreamLeaderChange(mset *Stream, sa *streamAssignmen
 			s.sendAPIResponse(sa.Client, acc, _EMPTY_, sa.Reply, _EMPTY_, s.jsonResponse(&resp))
 		} else {
 			fmt.Printf("\n\n[%s] - Successfully created our stream!!! %+v\n\n", s.Name(), mset)
-			fmt.Printf("s is %q, acc is %q\n", s.Name(), acc.Name)
 			resp.StreamInfo = &StreamInfo{Created: mset.Created(), State: mset.State(), Config: mset.Config()}
 			js.srv.sendAPIResponse(sa.Client, acc, _EMPTY_, sa.Reply, _EMPTY_, s.jsonResponse(&resp))
 		}
@@ -631,9 +688,8 @@ func (js *jetStream) processStreamLeaderChange(mset *Stream, sa *streamAssignmen
 // Will lookup a stream assignment.
 // Lock should be held.
 func (js *jetStream) streamAssignment(account, stream string) (sa *streamAssignment) {
-	accStreams := js.cluster.streams[account]
-	if accStreams != nil {
-		sa = accStreams[stream]
+	if as := js.cluster.streams[account]; as != nil {
+		sa = as[stream]
 	}
 	return sa
 }
@@ -1022,8 +1078,8 @@ func (o *Consumer) raftNode() RaftNode {
 }
 
 func (js *jetStream) monitorConsumerRaftGroup(o *Consumer, ca *consumerAssignment) {
-	fmt.Printf("[%s] Starting consumer monitor raft group routine\n", ca.Group.Name)
-	defer fmt.Printf("[%s] Exiting consumer monitor raft group routine\n", ca.Group.Name)
+	fmt.Printf("[%s:%s] Starting consumer monitor raft group routine\n", js.srv, ca.Group.Name)
+	defer fmt.Printf("[%s:%s] Exiting consumer monitor raft group routine\n", js.srv, ca.Group.Name)
 
 	s, n := js.server(), o.raftNode()
 	if n == nil {
@@ -1052,26 +1108,68 @@ func (js *jetStream) monitorConsumerRaftGroup(o *Consumer, ca *consumerAssignmen
 }
 
 func (js *jetStream) applyConsumerEntries(o *Consumer, entries [][]byte) {
-	fmt.Printf("[%s] JS GROUP %q HAS CONSUMER ENTRIES UPDATE TO APPLY!\n", js.srv.Name(), o.node.Group())
+	fmt.Printf("[%s] JS GROUP %q HAS CONSUMER ENTRIES UPDATE TO APPLY!\n", js.srv, o.node.Group())
 	for _, buf := range entries {
 		switch entryOp(buf[0]) {
-		/*
-			case streamMsgOp:
-				subject, reply, hdr, msg, err := decodeStreamMsg(buf[1:])
-				if err != nil {
-					panic(err.Error())
-				}
-				fmt.Printf("[%s] DECODED %q %q %q %q\n\n", js.srv.Name(), subject, reply, hdr, msg)
-				mset.processJetStreamMsg(subject, reply, hdr, msg)
-		*/
+		case updateDeliveredOp:
+			dseq, sseq, dc, ts, err := decodeDeliveredUpdate(buf[1:])
+			if err != nil {
+				panic(err.Error())
+			}
+			if err := o.store.UpdateDelivered(dseq, sseq, dc, ts); err != nil {
+				panic(err.Error())
+			}
+		case updateAcksOp:
+			dseq, sseq, err := decodeAckUpdate(buf[1:])
+			if err != nil {
+				panic(err.Error())
+			}
+			if err := o.store.UpdateAcks(dseq, sseq); err != nil {
+				panic(err.Error())
+			}
 		default:
 			panic("JetStream Cluster Unknown group entry op type!")
 		}
 	}
 }
 
+var errBadAckUpdate = errors.New("jetstream cluster bad replicated ack update")
+var errBadDeliveredUpdate = errors.New("jetstream cluster bad replicated delivered update")
+
+func decodeAckUpdate(buf []byte) (dseq, sseq uint64, err error) {
+	var bi, n int
+	if dseq, n = binary.Uvarint(buf); n < 0 {
+		return 0, 0, errBadAckUpdate
+	}
+	bi += n
+	if sseq, n = binary.Uvarint(buf[bi:]); n < 0 {
+		return 0, 0, errBadAckUpdate
+	}
+	return dseq, sseq, nil
+}
+
+func decodeDeliveredUpdate(buf []byte) (dseq, sseq, dc uint64, ts int64, err error) {
+	var bi, n int
+	if dseq, n = binary.Uvarint(buf); n < 0 {
+		return 0, 0, 0, 0, errBadDeliveredUpdate
+	}
+	bi += n
+	if sseq, n = binary.Uvarint(buf[bi:]); n < 0 {
+		return 0, 0, 0, 0, errBadDeliveredUpdate
+	}
+	bi += n
+	if dc, n = binary.Uvarint(buf[bi:]); n < 0 {
+		return 0, 0, 0, 0, errBadDeliveredUpdate
+	}
+	bi += n
+	if ts, n = binary.Varint(buf[bi:]); n < 0 {
+		return 0, 0, 0, 0, errBadDeliveredUpdate
+	}
+	return dseq, sseq, dc, ts, nil
+}
+
 func (js *jetStream) processConsumerLeaderChange(o *Consumer, ca *consumerAssignment, isLeader bool) {
-	fmt.Printf("\n\n[%s] JS detected consumer leadership change for %q! %v\n", js.srv.Name(), ca.Group.Name, isLeader)
+	fmt.Printf("\n\n[%s] JS detected consumer leadership change for %q! %v\n", js.srv, ca.Group.Name, isLeader)
 
 	o.setLeader(isLeader)
 
@@ -1080,20 +1178,21 @@ func (js *jetStream) processConsumerLeaderChange(o *Consumer, ca *consumerAssign
 	}
 
 	// Check if we need to respond to the original request.
+	// FIXME(dlc) - need to replicate responded state or do simple signal. ok if we send twice.
 	js.mu.Lock()
 	responded, err := ca.responded, ca.err
 	ca.responded = true
 	s := js.srv
 	js.mu.Unlock()
 
-	if !responded {
+	if isLeader && !responded {
 		acc := o.account()
 		var resp = JSApiConsumerCreateResponse{ApiResponse: ApiResponse{Type: JSApiConsumerCreateResponseType}}
 		if err != nil {
 			resp.Error = jsError(err)
 			s.sendAPIResponse(ca.Client, acc, _EMPTY_, ca.Reply, _EMPTY_, s.jsonResponse(&resp))
 		} else {
-			fmt.Printf("\n\n[%s] - Successfully created our consumer!!! %+v\n\n", s.Name(), o)
+			fmt.Printf("\n\n[%s] - Successfully created our consumer!!! %+v\n\n", s, o)
 			fmt.Printf("s is %q, acc is %q\n", s.Name(), acc.Name)
 			resp.ConsumerInfo = o.Info()
 			js.srv.sendAPIResponse(ca.Client, acc, _EMPTY_, ca.Reply, _EMPTY_, s.jsonResponse(&resp))
@@ -1102,12 +1201,12 @@ func (js *jetStream) processConsumerLeaderChange(o *Consumer, ca *consumerAssign
 }
 
 func (js *jetStream) processLeaderChange(isLeader bool) {
-	fmt.Printf("[%s] JS detected leadership change! %v\n", js.srv.Name(), isLeader)
+	fmt.Printf("[%s] JS detected leadership change! %v\n", js.srv, isLeader)
 
 	js.mu.Lock()
 	defer js.mu.Unlock()
 
-	fmt.Printf("[%s] Processing leader change!!\n\n", js.srv.Name())
+	fmt.Printf("[%s] Processing leader change!!\n\n", js.srv)
 
 	if !isLeader {
 		// TODO(dlc) - stepdown.

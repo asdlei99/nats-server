@@ -161,7 +161,7 @@ func TestJetStreamClusterAccountInfo(t *testing.T) {
 	}
 }
 
-func jsClientConnect(t *testing.T, s *server.Server) (*nats.Conn, nats.JetStream) {
+func jsClientConnect(t *testing.T, s *server.Server) (*nats.Conn, nats.JetStreamContext) {
 	t.Helper()
 	nc, err := nats.Connect(s.ClientURL())
 	if err != nil {
@@ -480,11 +480,117 @@ func TestJetStreamClusterStreamPurge(t *testing.T) {
 	if pResp.Purged != uint64(toSend) {
 		t.Fatalf("Expected %d purged, got %d", toSend, pResp.Purged)
 	}
+}
 
+func TestJetStreamClusterConsumerState(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	s := c.randomServer()
+
+	// Client based API
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo", "bar"},
+		Replicas: 3,
+	})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	msg, toSend := []byte("Hello JS Clustering"), 10
+	for i := 0; i < toSend; i++ {
+		if _, err = js.Publish("foo", msg); err != nil {
+			t.Fatalf("Unexpected publish error: %v", err)
+		}
+	}
+
+	sub, err := js.SubscribeSync("foo", nats.Durable("dlc"), nats.Pull(1))
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	checkSubsPending(t, sub, 1)
+
+	fmt.Printf("\nGETTING 5 MSGS\n\n")
+
+	// Pull 5 messages and ack.
+	for i := 0; i < 5; i++ {
+		m, err := sub.NextMsg(time.Second)
+		if err != nil {
+			t.Fatalf("Unexpected error getting msg %d: %v", i+1, err)
+		}
+		m.Ack()
+	}
+
+	ci, _ := sub.ConsumerInfo()
+	if ci.AckFloor.Consumer != 5 {
+		t.Fatalf("Expected ack floor of %d, got %d", 5, ci.AckFloor.Consumer)
+	}
+	fmt.Printf("\n\n############ CI is %+v\n\n", ci)
+
+	fmt.Printf("\nSHUTDOWN CONSUMER LEADER %q\n\n", c.consumerLeader("$G", "TEST", "dlc"))
+	c.consumerLeader("$G", "TEST", "dlc").Shutdown()
+	c.waitOnNewConsumerLeader("$G", "TEST", "dlc")
+	fmt.Printf("\nHAVE NEW CONSUMER LEADER %q\n\n", c.consumerLeader("$G", "TEST", "dlc"))
+
+	nci, _ := sub.ConsumerInfo()
+	fmt.Printf("\n\n############ NCI is %+v\n\n", nci)
+	if nci.Delivered != ci.Delivered {
+		t.Fatalf("Consumer delivered did not match after leader switch, wanted %+v, got %+v", ci.Delivered, nci.Delivered)
+	}
+	if nci.AckFloor != ci.AckFloor {
+		t.Fatalf("Consumer ackfloor did not match after leader switch, wanted %+v, got %+v", ci.AckFloor, nci.AckFloor)
+	}
+
+	// Now make sure we can receive new messages.
+	// Pull last 5.
+	for i := 0; i < 5; i++ {
+		m, err := sub.NextMsg(time.Second)
+		if err != nil {
+			t.Fatalf("Unexpected error getting msg %d: %v", i+1, err)
+		}
+		m.Ack()
+	}
+	nci, _ = sub.ConsumerInfo()
+	fmt.Printf("\n\n############ NCI2 is %+v\n\n", nci)
+	if nci.Delivered.Consumer != 10 || nci.Delivered.Stream != 10 {
+		t.Fatalf("Received bad delivered: %+v", nci.Delivered)
+	}
+	if nci.AckFloor.Consumer != 10 || nci.AckFloor.Stream != 10 {
+		t.Fatalf("Received bad ackfloor: %+v", nci.AckFloor)
+	}
+	if nci.NumAckPending != 0 {
+		t.Fatalf("Received bad ackpending: %+v", nci.NumAckPending)
+	}
 }
 
 func (c *cluster) checkClusterFormed() {
 	checkClusterFormed(c.t, c.servers...)
+}
+
+func (c *cluster) waitOnNewConsumerLeader(account, stream, consumer string) {
+	c.t.Helper()
+	expires := time.Now().Add(5 * time.Second)
+	for time.Now().Before(expires) {
+		if leader := c.consumerLeader(account, stream, consumer); leader != nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	c.t.Fatalf("Expected a consumer leader for %q %q %q, got none", account, stream, consumer)
+}
+
+func (c *cluster) consumerLeader(account, stream, consumer string) *server.Server {
+	c.t.Helper()
+	for _, s := range c.servers {
+		if s.JetStreamIsConsumerLeader(account, stream, consumer) {
+			return s
+		}
+	}
+	return nil
 }
 
 func (c *cluster) randomNonLeader() *server.Server {
@@ -519,6 +625,18 @@ func (c *cluster) expectNoLeader() {
 	}
 }
 
+func (c *cluster) waitOnLeader() {
+	c.t.Helper()
+	expires := time.Now().Add(5 * time.Second)
+	for time.Now().Before(expires) {
+		if leader := c.leader(); leader != nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	c.t.Fatalf("Expected a cluster leader, got none")
+}
+
 // Helper function to check that a cluster is formed
 func (c *cluster) waitOnClusterReady() {
 	c.t.Helper()
@@ -531,12 +649,12 @@ func (c *cluster) waitOnClusterReady() {
 		time.Sleep(10 * time.Millisecond)
 	}
 	// Now make sure we have all peers.
-	for time.Now().Before(expires) {
+	for leader != nil && time.Now().Before(expires) {
 		fmt.Printf("len servers is %d, peers is %d\n", len(c.servers), len(leader.JetStreamClusterPeers()))
 		if len(leader.JetStreamClusterPeers()) == len(c.servers) {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	c.t.Fatalf("Expected a meta leader, got none")
+	c.t.Fatalf("Expected a cluster leader and fully formed cluster")
 }

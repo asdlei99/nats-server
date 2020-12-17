@@ -3071,15 +3071,18 @@ func (o *consumerFileStore) encodeState() ([]byte, error) {
 	if o.closed {
 		return nil, ErrStoreClosed
 	}
+	return encodeConsumerState(&o.state), nil
+}
 
+func encodeConsumerState(state *ConsumerState) []byte {
 	var hdr [seqsHdrSize]byte
 	var buf []byte
 
 	maxSize := seqsHdrSize
-	if lp := len(o.state.Pending); lp > 0 {
+	if lp := len(state.Pending); lp > 0 {
 		maxSize += lp*(3*binary.MaxVarintLen64) + binary.MaxVarintLen64
 	}
-	if lr := len(o.state.Redelivered); lr > 0 {
+	if lr := len(state.Redelivered); lr > 0 {
 		maxSize += lr*(2*binary.MaxVarintLen64) + binary.MaxVarintLen64
 	}
 	if maxSize == seqsHdrSize {
@@ -3095,23 +3098,23 @@ func (o *consumerFileStore) encodeState() ([]byte, error) {
 	buf[1] = 2
 
 	n := hdrLen
-	n += binary.PutUvarint(buf[n:], o.state.AckFloor.Consumer)
-	n += binary.PutUvarint(buf[n:], o.state.AckFloor.Stream)
-	n += binary.PutUvarint(buf[n:], o.state.Delivered.Consumer)
-	n += binary.PutUvarint(buf[n:], o.state.Delivered.Stream)
-	n += binary.PutUvarint(buf[n:], uint64(len(o.state.Pending)))
+	n += binary.PutUvarint(buf[n:], state.AckFloor.Consumer)
+	n += binary.PutUvarint(buf[n:], state.AckFloor.Stream)
+	n += binary.PutUvarint(buf[n:], state.Delivered.Consumer)
+	n += binary.PutUvarint(buf[n:], state.Delivered.Stream)
+	n += binary.PutUvarint(buf[n:], uint64(len(state.Pending)))
 
-	asflr := o.state.AckFloor.Stream
-	adflr := o.state.AckFloor.Consumer
+	asflr := state.AckFloor.Stream
+	adflr := state.AckFloor.Consumer
 
 	// These are optional, but always write len. This is to avoid a truncate inline.
-	if len(o.state.Pending) > 0 {
+	if len(state.Pending) > 0 {
 		// To save space we will use now rounded to seconds to be base timestamp.
 		mints := now.Round(time.Second).Unix()
 		// Write minimum timestamp we found from above.
 		n += binary.PutVarint(buf[n:], mints)
 
-		for k, v := range o.state.Pending {
+		for k, v := range state.Pending {
 			n += binary.PutUvarint(buf[n:], k-asflr)
 			n += binary.PutUvarint(buf[n:], v.Sequence-adflr)
 			// Downsample to seconds to save on space.
@@ -3122,17 +3125,17 @@ func (o *consumerFileStore) encodeState() ([]byte, error) {
 	}
 
 	// We always write the redelivered len.
-	n += binary.PutUvarint(buf[n:], uint64(len(o.state.Redelivered)))
+	n += binary.PutUvarint(buf[n:], uint64(len(state.Redelivered)))
 
 	// We expect these to be small.
-	if len(o.state.Redelivered) > 0 {
-		for k, v := range o.state.Redelivered {
+	if len(state.Redelivered) > 0 {
+		for k, v := range state.Redelivered {
 			n += binary.PutUvarint(buf[n:], k-asflr)
 			n += binary.PutUvarint(buf[n:], v)
 		}
 	}
 
-	return buf[:n], nil
+	return buf[:n]
 }
 
 func (o *consumerFileStore) Update(state *ConsumerState) error {
@@ -3329,13 +3332,37 @@ func (o *consumerFileStore) State() (*ConsumerState, error) {
 		return state, nil
 	}
 
+	state, err = decodeConsumerState(buf)
+	if err != nil {
+		return nil, err
+	}
+
+	// Copy this state into our own.
+	o.state.Delivered = state.Delivered
+	o.state.AckFloor = state.AckFloor
+	if len(state.Pending) > 0 {
+		o.state.Pending = make(map[uint64]*Pending, len(state.Pending))
+		for seq, p := range state.Pending {
+			o.state.Pending[seq] = &Pending{p.Sequence, p.Timestamp}
+		}
+	}
+	if len(state.Redelivered) > 0 {
+		o.state.Redelivered = make(map[uint64]uint64, len(state.Redelivered))
+		for seq, dc := range state.Redelivered {
+			o.state.Redelivered[seq] = dc
+		}
+	}
+
+	return state, nil
+}
+
+func decodeConsumerState(buf []byte) (*ConsumerState, error) {
 	version, err := checkConsumerHeader(buf)
 	if err != nil {
 		return nil, err
 	}
 
 	bi := hdrLen
-
 	// Helpers, will set i to -1 on error.
 	readSeq := func() uint64 {
 		if bi < 0 {
@@ -3365,7 +3392,7 @@ func (o *consumerFileStore) State() (*ConsumerState, error) {
 	readLen := readSeq
 	readCount := readSeq
 
-	state = &ConsumerState{}
+	state := &ConsumerState{}
 	state.AckFloor.Consumer = readSeq()
 	state.AckFloor.Stream = readSeq()
 	state.Delivered.Consumer = readSeq()
@@ -3381,10 +3408,8 @@ func (o *consumerFileStore) State() (*ConsumerState, error) {
 		state.Delivered.Stream += state.AckFloor.Stream - 1
 	}
 
-	numPending := readLen()
-
 	// We have additional stuff.
-	if numPending > 0 {
+	if numPending := readLen(); numPending > 0 {
 		mints := readTimeStamp()
 		state.Pending = make(map[uint64]*Pending, numPending)
 		for i := 0; i < int(numPending); i++ {
@@ -3413,10 +3438,8 @@ func (o *consumerFileStore) State() (*ConsumerState, error) {
 		}
 	}
 
-	numRedelivered := readLen()
-
 	// We have redelivered entries here.
-	if numRedelivered > 0 {
+	if numRedelivered := readLen(); numRedelivered > 0 {
 		state.Redelivered = make(map[uint64]uint64, numRedelivered)
 		for i := 0; i < int(numRedelivered); i++ {
 			seq := readSeq()
@@ -3425,22 +3448,6 @@ func (o *consumerFileStore) State() (*ConsumerState, error) {
 				return nil, errCorruptState
 			}
 			state.Redelivered[seq] = n
-		}
-	}
-
-	// Copy this state into our own.
-	o.state.Delivered = state.Delivered
-	o.state.AckFloor = state.AckFloor
-	if len(state.Pending) > 0 {
-		o.state.Pending = make(map[uint64]*Pending, len(state.Pending))
-		for seq, p := range state.Pending {
-			o.state.Pending[seq] = &Pending{p.Sequence, p.Timestamp}
-		}
-	}
-	if len(state.Redelivered) > 0 {
-		o.state.Redelivered = make(map[uint64]uint64, len(state.Redelivered))
-		for seq, dc := range state.Redelivered {
-			o.state.Redelivered[seq] = dc
 		}
 	}
 

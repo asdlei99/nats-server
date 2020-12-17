@@ -1049,6 +1049,13 @@ func (s *Server) jsStreamInfoRequest(sub *subscription, c *client, subject, repl
 	}
 
 	name := streamNameFromSubject(subject)
+
+	// If we are in clustered mode we need to be the stream leader to proceed.
+	if s.JetStreamIsClustered() && !acc.JetStreamIsStreamLeader(name) {
+		fmt.Printf("[%s] StreamInfo skipping this server, not leader!!!\n", s.Name())
+		return
+	}
+
 	if !acc.jetStreamReadAllowedForStream(name) {
 		return
 	}
@@ -1863,6 +1870,15 @@ func (s *Server) jsConsumerInfoRequest(sub *subscription, c *client, subject, re
 		return
 	}
 
+	stream := streamNameFromSubject(subject)
+	consumer := consumerNameFromSubject(subject)
+
+	// If we are in clustered mode we need to be the stream leader to proceed.
+	if s.JetStreamIsClustered() && !acc.JetStreamIsConsumerLeader(stream, consumer) {
+		fmt.Printf("[%s] ConsumerInfo skipping this server, not leader!!!\n", s.Name())
+		return
+	}
+
 	var resp = JSApiConsumerInfoResponse{ApiResponse: ApiResponse{Type: JSApiConsumerInfoResponseType}}
 	if !acc.JetStreamEnabled() {
 		resp.Error = jsNotEnabledErr
@@ -1875,14 +1891,13 @@ func (s *Server) jsConsumerInfoRequest(sub *subscription, c *client, subject, re
 		return
 	}
 
-	stream := streamNameFromSubject(subject)
 	mset, err := acc.LookupStream(stream)
 	if err != nil {
 		resp.Error = jsNotFoundError(err)
 		s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
-	consumer := consumerNameFromSubject(subject)
+
 	obs := mset.LookupConsumer(consumer)
 	if obs == nil {
 		resp.Error = jsNoConsumerErr

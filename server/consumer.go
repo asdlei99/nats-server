@@ -15,6 +15,7 @@ package server
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -440,6 +441,10 @@ func (mset *Stream) addConsumer(config *ConsumerConfig, oname string, node RaftN
 		maxp:    config.MaxAckPending,
 		created: time.Now().UTC(),
 	}
+
+	// Bind internal client
+	o.client.registerWithAccount(a)
+
 	if isDurableConsumer(config) {
 		if len(config.Durable) > JSMaxNameLen {
 			mset.mu.Unlock()
@@ -580,6 +585,7 @@ func (o *Consumer) isLeader() bool {
 func (o *Consumer) setLeader(isLeader bool) {
 	o.mu.RLock()
 	mset := o.mset
+	isRunning := o.ackSub != nil
 	o.mu.RUnlock()
 
 	if mset == nil {
@@ -588,8 +594,16 @@ func (o *Consumer) setLeader(isLeader bool) {
 
 	// If we are here we have a change in leader status.
 	if isLeader {
-		fmt.Printf("[%s] - SETUP INTERNAL SUBSCRIPTION(s) for consumer %q\n\n", o.acc.srv.Name(), o.name)
+		fmt.Printf("[%s] - SETUP for consumer becoming leader %q\n\n", o.acc.srv.Name(), o.name)
+		if isRunning {
+			fmt.Printf("[%s] - Consumer setLeader(true) but was already up and running!\n", o.acc.srv.Name())
+			return
+		}
+
 		o.mu.Lock()
+		// Restore our saved state. During non-leader status we just update our underlying store.
+		o.readStoredState()
+
 		var err error
 		if o.ackSub, err = o.subscribeInternal(o.ackSubj, o.processAck); err != nil {
 			o.mu.Unlock()
@@ -598,7 +612,6 @@ func (o *Consumer) setLeader(isLeader bool) {
 		}
 		// Setup the internal sub for next message requests.
 		if !o.isPushMode() {
-			//o.nextMsgSubj = fmt.Sprintf(JSApiRequestNextT, mn, o.name)
 			if o.reqSub, err = o.subscribeInternal(o.nextMsgSubj, o.processNextMsgReq); err != nil {
 				o.mu.Unlock()
 				o.deleteWithoutAdvisory()
@@ -620,8 +633,10 @@ func (o *Consumer) setLeader(isLeader bool) {
 			o.replay = true
 		}
 
-		// Create internal sendq
+		// Recreate internal sendq
 		o.sendq = make(chan *jsPubMsg, msetSendQSize)
+		// Recreate quit channel.
+		o.qch = make(chan struct{})
 		o.mu.Unlock()
 
 		// Now start up Go routine to deliver msgs.
@@ -631,12 +646,18 @@ func (o *Consumer) setLeader(isLeader bool) {
 
 	} else {
 		// Shutdown the go routines and the subscriptions.
-		o.mu.Lock()
-		if o.ackSub == nil {
+		if !isRunning {
 			fmt.Printf("[%s] - Consumer setLeader(false) but was not running yet!\n", o.acc.srv.Name())
-			o.mu.Unlock()
 			return
 		}
+		o.mu.Lock()
+		o.unsubscribe(o.ackSub)
+		o.unsubscribe(o.reqSub)
+		o.ackSub = nil
+		o.reqSub = nil
+		o.sendq = nil
+		close(o.qch)
+		o.qch = nil
 		o.mu.Unlock()
 	}
 }
@@ -658,6 +679,15 @@ func (o *Consumer) subscribeInternal(subject string, cb msgHandler) (*subscripti
 
 	// Now create the subscription
 	return c.processSub([]byte(subject), nil, []byte(strconv.Itoa(o.sid)), cb, false)
+}
+
+// Unsubscribe from our subscription.
+// Lock should be held.
+func (o *Consumer) unsubscribe(sub *subscription) {
+	if sub == nil || o.client == nil {
+		return
+	}
+	o.client.unsubscribe(o.client.acc, sub, true, true)
 }
 
 // This will unsubscribe us from the exact subject given.
@@ -934,10 +964,43 @@ func (o *Consumer) progressUpdate(seq uint64) {
 		if p, ok := o.pending[seq]; ok {
 			p.Timestamp = time.Now().UnixNano()
 			// Update store system.
-			o.store.UpdateDelivered(p.Sequence, seq, 1, p.Timestamp)
+			o.updateDelivered(p.Sequence, seq, 1, p.Timestamp)
 		}
 	}
 	o.mu.Unlock()
+}
+
+// Lock should be held.
+func (o *Consumer) updateDelivered(dseq, sseq, dc uint64, ts int64) {
+	// Clustered mode and R>1.
+	if o.node != nil {
+		// Inline for now, use variable compression.
+		var b [4*binary.MaxVarintLen64 + 1]byte
+		b[0] = byte(updateDeliveredOp)
+		n := 1
+		n += binary.PutUvarint(b[n:], dseq)
+		n += binary.PutUvarint(b[n:], sseq)
+		n += binary.PutUvarint(b[n:], dc)
+		n += binary.PutVarint(b[n:], ts)
+		o.node.Propose(b[:n])
+	} else {
+		o.store.UpdateDelivered(dseq, sseq, dc, ts)
+	}
+}
+
+// Lock should be held.
+func (o *Consumer) updateAcks(dseq, sseq uint64) {
+	if o.node != nil {
+		// Inline for now, use variable compression.
+		var b [2*binary.MaxVarintLen64 + 1]byte
+		b[0] = byte(updateAcksOp)
+		n := 1
+		n += binary.PutUvarint(b[n:], dseq)
+		n += binary.PutUvarint(b[n:], sseq)
+		o.node.Propose(b[:n])
+	} else {
+		o.store.UpdateAcks(dseq, sseq)
+	}
 }
 
 // Process a NAK.
@@ -1024,9 +1087,7 @@ func (o *Consumer) readStoredState() error {
 
 	// Setup tracking timer if we have restored pending.
 	if len(o.pending) > 0 && o.ptmr == nil {
-		o.mu.Lock()
 		o.ptmr = time.AfterFunc(o.ackWait(0), o.checkPending)
-		o.mu.Unlock()
 	}
 	return err
 }
@@ -1268,7 +1329,7 @@ func (o *Consumer) processAckMsg(sseq, dseq, dc uint64, doSample bool) {
 	}
 
 	// Update underlying store.
-	o.store.UpdateAcks(dseq, sseq)
+	o.updateAcks(dseq, sseq)
 
 	mset := o.mset
 	o.mu.Unlock()
@@ -1858,7 +1919,7 @@ func (o *Consumer) deliverMsg(dsubj, subj string, hdr, msg []byte, seq, dc uint6
 	o.dseq++
 
 	// FIXME(dlc) - Capture errors?
-	o.store.UpdateDelivered(dseq, seq, dc, ts)
+	o.updateDelivered(dseq, seq, dc, ts)
 }
 
 // Tracks our outstanding pending acks. Only applicable to AckExplicit mode.
@@ -2236,17 +2297,22 @@ func (o *Consumer) stop(dflag, doSignal, advisory bool) error {
 		o.sendDeleteAdvisoryLocked()
 	}
 
-	a := o.acc
-	close(o.qch)
+	if o.qch != nil {
+		close(o.qch)
+		o.qch = nil
+	}
 
+	a := o.acc
 	store := o.store
 	mset := o.mset
 	o.mset = nil
 	o.active = false
-	ackSub := o.ackSub
-	reqSub := o.reqSub
+	o.unsubscribe(o.ackSub)
+	o.unsubscribe(o.reqSub)
 	o.ackSub = nil
 	o.reqSub = nil
+	c := o.client
+	o.client = nil
 	stopAndClearTimer(&o.ptmr)
 	stopAndClearTimer(&o.dtmr)
 	delivery := o.config.DeliverSubject
@@ -2258,13 +2324,15 @@ func (o *Consumer) stop(dflag, doSignal, advisory bool) error {
 	n := o.node
 	o.mu.Unlock()
 
+	if c != nil {
+		c.closeConnection(ClientClosed)
+	}
+
 	if delivery != "" {
 		a.sl.ClearNotification(delivery, o.inch)
 	}
 
 	mset.mu.Lock()
-	mset.unsubscribe(ackSub)
-	mset.unsubscribe(reqSub)
 	mset.deleteConsumer(o)
 	rp := mset.config.Retention
 	mset.mu.Unlock()

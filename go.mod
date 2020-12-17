@@ -5,7 +5,7 @@ go 1.15
 require (
 	github.com/minio/highwayhash v1.0.0
 	github.com/nats-io/jwt/v2 v2.0.0-20201015190852-e11ce317263c
-	github.com/nats-io/nats.go v1.10.1-0.20201211042643-d3e886210b0d
+	github.com/nats-io/nats.go v1.10.1-0.20201216235624-a3519e1e54ea
 	github.com/nats-io/nkeys v0.2.0
 	github.com/nats-io/nuid v1.0.1
 	golang.org/x/crypto v0.0.0-20201016220609-9e8e0b390897

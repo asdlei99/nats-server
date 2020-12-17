@@ -2649,6 +2649,10 @@ func (s *Server) Name() string {
 	return s.info.Name
 }
 
+func (s *Server) String() string {
+	return s.Name()
+}
+
 func (s *Server) startGoRoutine(f func()) bool {
 	var started bool
 	s.grMu.Lock()
