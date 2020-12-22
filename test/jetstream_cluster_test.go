@@ -80,7 +80,7 @@ func createJetStreamClusterExplicit(t *testing.T, clusterName string, numServers
 	return c
 }
 
-func (c *cluster) addInNewServer() {
+func (c *cluster) addInNewServer() *server.Server {
 	c.t.Helper()
 	sn := fmt.Sprintf("S-%d", len(c.servers)+1)
 	storeDir, _ := ioutil.TempDir("", server.JetStreamStoreDir)
@@ -94,6 +94,7 @@ func (c *cluster) addInNewServer() {
 	c.servers = append(c.servers, s)
 	c.opts = append(c.opts, o)
 	c.checkClusterFormed()
+	return s
 }
 
 // Hack for staticcheck
@@ -428,7 +429,7 @@ func TestJetStreamClusterDelete(t *testing.T) {
 		t.Fatalf("Unexpected error: %v", err)
 	}
 	if !cdResp.Success || cdResp.Error != nil {
-		t.Fatalf("Got a bad response %+v", ccResp)
+		t.Fatalf("Got a bad response %+v", cdResp)
 	}
 
 	time.Sleep(5 * time.Second)
@@ -684,6 +685,91 @@ func TestJetStreamClusterMetaSnapshotsAndCatchup(t *testing.T) {
 	}
 
 	fmt.Printf("\n\nDONE DELETING STREAMS - RESTARTING SERVER %q\n\n", rs)
+
+	rs = c.restartServer(rs)
+	c.checkClusterFormed()
+	c.waitOnServerCurrent(rs)
+
+	fmt.Printf("\n\nSHUTTING DOWN\n\n")
+}
+
+func TestJetStreamClusterMetaSnapshotsMultiChange(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 2)
+	defer c.shutdown()
+
+	s := c.leader()
+
+	// Client based API
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	fmt.Printf("\n\nCREATING STREAMS AND CONSUMERS\n\n")
+
+	// Add in 2 streams with 1 consumer each.
+	if _, err := js.AddStream(&nats.StreamConfig{Name: "S1"}); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	_, err := js.AddConsumer("S1", &nats.ConsumerConfig{Durable: "S1C1", AckPolicy: nats.AckExplicit})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	if _, err = js.AddStream(&nats.StreamConfig{Name: "S2"}); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	_, err = js.AddConsumer("S2", &nats.ConsumerConfig{Durable: "S2C1", AckPolicy: nats.AckExplicit})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	// Add in a new server to the group. This way we know we can delete the original streams and consumers.
+	rs := c.addInNewServer()
+	c.waitOnServerCurrent(rs)
+
+	// Shut it down.
+	fmt.Printf("\n\nDONE CREATING STREAMS AND CONSUMERS - STOPPING SERVER %q\n\n", rs)
+
+	rs.Shutdown()
+
+	fmt.Printf("\n\nCREATING STREAMS AND CONSUMERS CHANGES\n\n")
+
+	// We want to make changes here that test each delta scenario for the meta snapshots.
+	// Add new stream and consumer.
+	if _, err = js.AddStream(&nats.StreamConfig{Name: "S3"}); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	_, err = js.AddConsumer("S3", &nats.ConsumerConfig{Durable: "S3C1", AckPolicy: nats.AckExplicit})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	// Delete stream S2
+	resp, _ := nc.Request(fmt.Sprintf(server.JSApiStreamDeleteT, "S2"), nil, time.Second)
+	var dResp server.JSApiStreamDeleteResponse
+	if err := json.Unmarshal(resp.Data, &dResp); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if !dResp.Success || dResp.Error != nil {
+		t.Fatalf("Got a bad response %+v", dResp.Error)
+	}
+	// Delete the consumer on S1 but add another.
+	resp, _ = nc.Request(fmt.Sprintf(server.JSApiConsumerDeleteT, "S1", "S1C1"), nil, time.Second)
+	var cdResp server.JSApiConsumerDeleteResponse
+	if err = json.Unmarshal(resp.Data, &cdResp); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if !cdResp.Success || cdResp.Error != nil {
+		t.Fatalf("Got a bad response %+v", cdResp)
+	}
+	// Add new consumer on S1
+	_, err = js.AddConsumer("S1", &nats.ConsumerConfig{Durable: "S1C2", AckPolicy: nats.AckExplicit})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	fmt.Printf("\n\nDONE CHANGING STREAMS AND CONSUMERS - SNAPSHOTTING & RESTARTING SERVER %q\n\n", rs)
+
+	c.leader().JetStreamSnapshotMeta()
+	time.Sleep(250 * time.Millisecond)
 
 	rs = c.restartServer(rs)
 	c.checkClusterFormed()

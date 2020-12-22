@@ -445,6 +445,7 @@ func (cc *jetStreamCluster) isStreamLeader(account, stream string) bool {
 	}
 	// Check if we are the leader of this raftGroup assigned to the stream.
 	ourID := cc.meta.ID()
+	fmt.Printf("[%s] ourId for isStreamLeader is %q\n", cc.s, ourID)
 	for _, peer := range rg.Peers {
 		if peer == ourID {
 			if len(rg.Peers) == 1 || rg.node.Leader() {
@@ -571,10 +572,12 @@ func (js *jetStream) applyMetaSnapshot(buf []byte) error {
 		}
 		as[wsa.Config.Name] = sa
 	}
-	fmt.Printf("Generated clone: %+v\n", streams)
 
 	js.mu.Lock()
 	cc := js.cluster
+
+	fmt.Printf("Generated clone: %+v\n", streams)
+	fmt.Printf("Original: %+v\n", cc.streams)
 
 	var saAdd, saDel, saChk []*streamAssignment
 	// Walk through the old list to generate the delete list.
@@ -609,7 +612,7 @@ func (js *jetStream) applyMetaSnapshot(buf []byte) error {
 					fmt.Printf("[%s] NEED TO REMOVE CA %+v\n", js.srv, ca)
 					caDel = append(caDel, ca)
 				} else {
-					fmt.Printf("[%s] NEED TO ADD CA %+v\n", js.srv, ca)
+					fmt.Printf("[%s] NEED TO [MAYBE] ADD CA %+v\n", js.srv, ca)
 					caAdd = append(caAdd, ca)
 				}
 			}
@@ -948,6 +951,9 @@ func (js *jetStream) processStreamRemoval(sa *streamAssignment) {
 	stream := sa.Config.Name
 
 	js.mu.Lock()
+
+	wasLeader := cc.isStreamLeader(sa.Client.Account, stream)
+
 	// Check if we already have this assigned.
 	accStreams := cc.streams[sa.Client.Account]
 	needDelete := accStreams != nil && accStreams[stream] != nil
@@ -957,15 +963,14 @@ func (js *jetStream) processStreamRemoval(sa *streamAssignment) {
 			delete(cc.streams, sa.Client.Account)
 		}
 	}
-	isMember := sa.Group.isMember(cc.meta.ID())
 	js.mu.Unlock()
 
-	if !needDelete || !isMember {
+	if !needDelete {
 		return
 	}
 
-	fmt.Printf("Will process remove strea, since we are a member!!\n")
-	js.processClusterDeleteStream(sa)
+	fmt.Printf("Will process remove stream regardless of membership!!\n")
+	js.processClusterDeleteStream(sa, wasLeader)
 }
 
 func (js *jetStream) processClusterCreateStream(sa *streamAssignment) {
@@ -1009,7 +1014,7 @@ func (js *jetStream) processClusterCreateStream(sa *streamAssignment) {
 	}
 }
 
-func (js *jetStream) processClusterDeleteStream(sa *streamAssignment) {
+func (js *jetStream) processClusterDeleteStream(sa *streamAssignment, wasLeader bool) {
 	if sa == nil {
 		return
 	}
@@ -1022,19 +1027,12 @@ func (js *jetStream) processClusterDeleteStream(sa *streamAssignment) {
 
 	acc, err := s.LookupAccount(sa.Client.Account)
 	if err != nil {
-		s.Warnf("JetStream cluster failed to lookup account %q: %v", sa.Client.Account, err)
+		s.Debugf("JetStream cluster failed to lookup account %q: %v", sa.Client.Account, err)
 		return
 	}
 
-	wasLeader, rg := true, sa.Group
-	if rg != nil {
-		// Need to lookup the orignal group
-		if n := s.lookupRaftNode(rg.Name); n != nil {
-			wasLeader = n.Leader()
-		}
-	}
-
-	fmt.Printf("[%s:%s]\tWill do stream delete. wasLeader? %v\n", js.srv.Name(), js.nodeID(), wasLeader)
+	fmt.Printf("[%s:%s]\tWill do stream delete. wasLeader? %v\n", js.srv, js.nodeID(), wasLeader)
+	fmt.Printf("[%s:%s]\tGroup is %+v\n", js.srv, js.nodeID(), sa.Group)
 
 	// Go ahead and delete the stream.
 	mset, err := acc.LookupStream(sa.Config.Name)
@@ -1075,17 +1073,17 @@ func (js *jetStream) processConsumerAssignment(ca *consumerAssignment) {
 	sa := js.streamAssignment(ca.Client.Account, ca.Stream)
 	if sa == nil {
 		// FIXME(dlc) - log.
+		js.mu.Unlock()
 		return
 	}
-	fmt.Printf("[%s] related sa is %+v\n", js.srv.Name(), sa)
+	fmt.Printf("[%s] related sa is %+v\n", js.srv, sa)
 
-	// If this one was already here that is ok, we replace with this new one.
-	// When it is added the low level JetStream code will do the right thing.
 	if sa.consumers == nil {
 		sa.consumers = make(map[string]*consumerAssignment)
 	}
 
 	// Place into our internal map under the stream assignment.
+	// Ok to replace an existing one, we check on process call below.
 	sa.consumers[ca.Name] = ca
 	// See if we are a member
 	isMember := ca.Group.isMember(cc.meta.ID())
@@ -1099,7 +1097,7 @@ func (js *jetStream) processConsumerAssignment(ca *consumerAssignment) {
 }
 
 func (js *jetStream) processConsumerRemoval(ca *consumerAssignment) {
-	fmt.Printf("[%s] Got a consumer removal %+v\n", js.srv.Name(), ca)
+	fmt.Printf("[%s] Got a consumer removal %+v\n", js.srv, ca)
 	js.mu.RLock()
 	s, cc := js.srv, js.cluster
 	js.mu.RUnlock()
@@ -1109,18 +1107,16 @@ func (js *jetStream) processConsumerRemoval(ca *consumerAssignment) {
 	}
 	// Delete from our state.
 	js.mu.Lock()
+	wasLeader := cc.isConsumerLeader(ca.Client.Account, ca.Stream, ca.Name)
 	if accStreams := cc.streams[ca.Client.Account]; accStreams != nil {
 		if sa := accStreams[ca.Stream]; sa != nil && sa.consumers != nil {
 			delete(sa.consumers, ca.Name)
 		}
 	}
-	isMember := ca.Group.isMember(cc.meta.ID())
 	js.mu.Unlock()
 
-	if isMember {
-		fmt.Printf("Will process remove consumer, since we are a member!!\n")
-		js.processClusterDeleteConsumer(ca)
-	}
+	fmt.Printf("Will process remove consumer regardless!!\n")
+	js.processClusterDeleteConsumer(ca, wasLeader)
 }
 
 // processClusterCreateConsumer is when we are a member fo the group and need to create the consumer.
@@ -1135,39 +1131,56 @@ func (js *jetStream) processClusterCreateConsumer(ca *consumerAssignment) {
 	s := js.srv
 	acc, err := s.LookupAccount(ca.Client.Account)
 	if err != nil {
-		s.Warnf("JetStream cluster failed to lookup account %q: %v", ca.Client.Account, err)
+		s.Debugf("JetStream cluster failed to lookup account %q: %v", ca.Client.Account, err)
 		js.mu.RUnlock()
 		return
 	}
 	rg := ca.Group
 	js.mu.RUnlock()
 
-	// Process the raft group and make sure its running if needed.
-	js.createRaftGroup(rg)
-
 	// Go ahead and create or update the consumer.
 	mset, err := acc.LookupStream(ca.Stream)
 	if err != nil {
-		s.Warnf("JetStream cluster error looking up stream %q for account %q: %v", ca.Stream, acc.Name, err)
+		s.Debugf("JetStream cluster error looking up stream %q for account %q: %v", ca.Stream, acc.Name, err)
 		ca.err = err
+		return
+	}
+
+	// Check if we already have this consumer running.
+	if o := mset.LookupConsumer(ca.Name); o != nil {
+		if o.isDurable() && o.isPushMode() {
+			ocfg := o.Config()
+			if configsEqualSansDelivery(ocfg, *ca.Config) && (ocfg.allowNoInterest || o.hasNoLocalInterest()) {
+				o.updateDeliverSubject(ca.Config.DeliverSubject)
+			}
+		}
+		s.Debugf("JetStream cluster, consumer already running")
+		fmt.Printf("\n**Consumer already running, not processing\n")
 		return
 	}
 
 	fmt.Printf("\n**Adding in consumer with rg %+v\n", rg)
 
 	// Add in the consumer.
-	consumer, err := mset.addConsumer(ca.Config, ca.Name, rg.node)
+	o, err := mset.addConsumer(ca.Config, ca.Name, rg.node)
 	if err != nil {
 		fmt.Printf("\n**ERROR in consumer: %v\n", err)
 		ca.err = err
 	}
+
+	// Process the raft group and make sure its running if needed.
+	js.createRaftGroup(rg)
+
 	// Start our monitoring routine.
 	if rg.node != nil {
-		s.startGoRoutine(func() { js.monitorConsumerRaftGroup(consumer, ca) })
+		s.startGoRoutine(func() { js.monitorConsumerRaftGroup(o, ca) })
+	} else {
+		// Single replica consumer, process manually here.
+		js.processConsumerLeaderChange(o, ca, true)
 	}
 }
 
-func (js *jetStream) processClusterDeleteConsumer(ca *consumerAssignment) {
+func (js *jetStream) processClusterDeleteConsumer(ca *consumerAssignment, wasLeader bool) {
 	if ca == nil {
 		return
 	}
@@ -1183,13 +1196,6 @@ func (js *jetStream) processClusterDeleteConsumer(ca *consumerAssignment) {
 		return
 	}
 
-	wasLeader, rg := true, ca.Group
-	if rg != nil {
-		// Need to lookup the orignal group
-		if n := s.lookupRaftNode(rg.Name); n != nil {
-			wasLeader = n.Leader()
-		}
-	}
 	fmt.Printf("[%s:%s]\tWill do consumer delete. wasLeader? %v\n", js.srv.Name(), js.nodeID(), wasLeader)
 
 	// Go ahead and delete the stream.
@@ -1397,13 +1403,12 @@ func (js *jetStream) processConsumerLeaderChange(o *Consumer, ca *consumerAssign
 		var resp = JSApiConsumerCreateResponse{ApiResponse: ApiResponse{Type: JSApiConsumerCreateResponseType}}
 		if err != nil {
 			resp.Error = jsError(err)
-			s.sendAPIResponse(ca.Client, acc, _EMPTY_, ca.Reply, _EMPTY_, s.jsonResponse(&resp))
 		} else {
 			fmt.Printf("\n\n[%s] - Successfully created our consumer!!! %+v\n\n", s, o)
 			fmt.Printf("s is %q, acc is %q\n", s.Name(), acc.Name)
 			resp.ConsumerInfo = o.Info()
-			js.srv.sendAPIResponse(ca.Client, acc, _EMPTY_, ca.Reply, _EMPTY_, s.jsonResponse(&resp))
 		}
+		s.sendAPIResponse(ca.Client, acc, _EMPTY_, ca.Reply, _EMPTY_, s.jsonResponse(&resp))
 	}
 }
 
