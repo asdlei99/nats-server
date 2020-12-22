@@ -27,6 +27,17 @@ import (
 	"github.com/nats-io/nats.go"
 )
 
+var jsClusterTempl = `
+	listen: 127.0.0.1:-1
+	server_name: %s
+	jetstream: {max_mem_store: 16GB, max_file_store: 10TB, store_dir: "%s"}
+	cluster {
+		name: %s
+		listen: 127.0.0.1:%d
+		routes = [%s]
+	}
+`
+
 // This will create a cluster that is explicitly configured for the routes, etc.
 // and also has a defined clustername. All configs for routes and cluster name will be the same.
 func createJetStreamClusterExplicit(t *testing.T, clusterName string, numServers int) *cluster {
@@ -36,16 +47,6 @@ func createJetStreamClusterExplicit(t *testing.T, clusterName string, numServers
 	}
 	const startClusterPort = 22332
 
-	templ := `
-		listen: 127.0.0.1:-1
-		server_name: %s
-		jetstream: {max_mem_store: 16GB, max_file_store: 10TB, store_dir: "%s"}
-		cluster {
-			name: %s
-			listen: 127.0.0.1:%d
-			routes = [%s]
-		}
-	`
 	// Build out the routes that will be shared with all configs.
 	var routes []string
 	for cp := startClusterPort; cp < startClusterPort+numServers; cp++ {
@@ -59,7 +60,7 @@ func createJetStreamClusterExplicit(t *testing.T, clusterName string, numServers
 	for cp := startClusterPort; cp < startClusterPort+numServers; cp++ {
 		storeDir, _ := ioutil.TempDir("", server.JetStreamStoreDir)
 		sn := fmt.Sprintf("S-%d", cp-startClusterPort+1)
-		conf := fmt.Sprintf(templ, sn, storeDir, clusterName, cp, routeConfig)
+		conf := fmt.Sprintf(jsClusterTempl, sn, storeDir, clusterName, cp, routeConfig)
 		s, o := RunServerWithConfig(createConfFile(t, []byte(conf)))
 		if doLog {
 			pre := fmt.Sprintf("[S-%d] - ", cp-startClusterPort+1)
@@ -77,6 +78,22 @@ func createJetStreamClusterExplicit(t *testing.T, clusterName string, numServers
 	fmt.Printf("\n\nCLUSTER FORMED AND READY!\n")
 
 	return c
+}
+
+func (c *cluster) addInNewServer() {
+	c.t.Helper()
+	sn := fmt.Sprintf("S-%d", len(c.servers)+1)
+	storeDir, _ := ioutil.TempDir("", server.JetStreamStoreDir)
+	seedRoute := fmt.Sprintf("nats-route://127.0.0.1:%d", c.opts[0].Cluster.Port)
+	conf := fmt.Sprintf(jsClusterTempl, sn, storeDir, c.name, -1, seedRoute)
+	s, o := RunServerWithConfig(createConfFile(c.t, []byte(conf)))
+	if doLog {
+		pre := fmt.Sprintf("[%s] - ", sn)
+		s.SetLogger(logger.NewTestLogger(pre, true), true, true)
+	}
+	c.servers = append(c.servers, s)
+	c.opts = append(c.opts, o)
+	c.checkClusterFormed()
 }
 
 // Hack for staticcheck
@@ -127,6 +144,18 @@ func TestJetStreamClusterLeader(t *testing.T) {
 	// Now killing our current leader should leave us leaderless.
 	c.leader().Shutdown()
 	c.expectNoLeader()
+}
+
+func TestJetStreamExpandCluster(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "JSC", 3)
+	defer c.shutdown()
+
+	fmt.Printf("\nEXPANDING THE CLUSTER\n\n")
+	c.addInNewServer()
+
+	fmt.Printf("\nDONE EXPANDING THE CLUSTER\n\n")
+	c.waitOnPeerCount(4)
+	fmt.Printf("\nDONE WAITING ON EXPANDING THE CLUSTER\n\n")
 }
 
 func TestJetStreamClusterAccountInfo(t *testing.T) {
@@ -567,8 +596,192 @@ func TestJetStreamClusterConsumerState(t *testing.T) {
 	}
 }
 
+func TestJetStreamClusterFullConsumerState(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	s := c.randomServer()
+
+	// Client based API
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo", "bar"},
+		Replicas: 3,
+	})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	msg, toSend := []byte("Hello JS Clustering"), 10
+	for i := 0; i < toSend; i++ {
+		if _, err = js.Publish("foo", msg); err != nil {
+			t.Fatalf("Unexpected publish error: %v", err)
+		}
+	}
+
+	sub, err := js.SubscribeSync("foo", nats.Durable("dlc"), nats.Pull(1))
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	checkSubsPending(t, sub, 1)
+	// Now purge the stream.
+	nc.Request(fmt.Sprintf(server.JSApiStreamPurgeT, "TEST"), nil, time.Second)
+}
+
+func TestJetStreamClusterMetaSnapshotsAndCatchup(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	// Shut one down.
+	rs := c.randomServer()
+	rs.Shutdown()
+	c.waitOnLeader()
+
+	s := c.leader()
+
+	// Client based API
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	fmt.Printf("\n\nCREATING STREAMS\n\n")
+
+	numStreams := 4
+	// Create 4 streams
+	// FIXME(dlc) - R2 make sure we place properly.
+	for i := 0; i < numStreams; i++ {
+		sn := fmt.Sprintf("T-%d", i+1)
+		_, err := js.AddStream(&nats.StreamConfig{Name: sn})
+		if err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+	}
+
+	fmt.Printf("\n\nDONE CREATING STREAMS - SNAPSHOTTING & RESTARTING SERVER %q\n\n", rs)
+	c.leader().JetStreamSnapshotMeta()
+	time.Sleep(250 * time.Millisecond)
+
+	rs = c.restartServer(rs)
+	c.checkClusterFormed()
+	c.waitOnServerCurrent(rs)
+
+	fmt.Printf("\n\nSHUTDOWN AGAIN, DELETE STREAMS\n\n")
+	rs.Shutdown()
+	c.waitOnLeader()
+
+	for i := 0; i < numStreams; i++ {
+		sn := fmt.Sprintf("T-%d", i+1)
+		resp, _ := nc.Request(fmt.Sprintf(server.JSApiStreamDeleteT, sn), nil, time.Second)
+		var dResp server.JSApiStreamDeleteResponse
+		if err := json.Unmarshal(resp.Data, &dResp); err != nil {
+			t.Fatalf("Unexpected error: %v", err)
+		}
+		if !dResp.Success || dResp.Error != nil {
+			t.Fatalf("Got a bad response %+v", dResp.Error)
+		}
+	}
+
+	fmt.Printf("\n\nDONE DELETING STREAMS - RESTARTING SERVER %q\n\n", rs)
+
+	rs = c.restartServer(rs)
+	c.checkClusterFormed()
+	c.waitOnServerCurrent(rs)
+
+	fmt.Printf("\n\nSHUTTING DOWN\n\n")
+}
+
+func TestJetStreamClusterStreamCatchup(t *testing.T) {
+	c := createJetStreamClusterExplicit(t, "R3S", 3)
+	defer c.shutdown()
+
+	s := c.randomServer()
+
+	// Client based API
+	nc, js := jsClientConnect(t, s)
+	defer nc.Close()
+
+	fmt.Printf("\n\nCREATING STREAM\n\n")
+
+	_, err := js.AddStream(&nats.StreamConfig{
+		Name:     "TEST",
+		Subjects: []string{"foo", "bar"},
+		Replicas: 3,
+	})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	msg, toSend := []byte("Hello JS Clustering"), 10
+	for i := 0; i < toSend; i++ {
+		if _, err = js.Publish("foo", msg); err != nil {
+			t.Fatalf("Unexpected publish error: %v", err)
+		}
+	}
+
+	sl := c.streamLeader("$G", "TEST")
+	fmt.Printf("\n\nSHUTDOWN STREAM LEADER %v\n\n", sl)
+
+	sl.Shutdown()
+	c.waitOnNewStreamLeader("$G", "TEST")
+
+	// Send 10 more..
+	for i := 0; i < toSend; i++ {
+		if _, err = js.Publish("foo", msg); err != nil {
+			t.Fatalf("Unexpected publish error: %v", err)
+		}
+	}
+
+	fmt.Printf("\n\nRESTART OLD STREAM LEADER %v\n\n", sl)
+	c.restartServer(sl)
+	c.checkClusterFormed()
+
+	time.Sleep(time.Second)
+	// FIXME(dlc)
+}
+
+func (c *cluster) restartServer(rs *server.Server) *server.Server {
+	c.t.Helper()
+	index := -1
+	var opts *server.Options
+	for i, s := range c.servers {
+		if s == rs {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		c.t.Fatalf("Could not find server %v to restart", rs)
+	}
+	opts = c.opts[index]
+	s, o := RunServerWithConfig(opts.ConfigFile)
+	if doLog {
+		pre := fmt.Sprintf("[%s] - ", s.Name())
+		s.SetLogger(logger.NewTestLogger(pre, true), true, true)
+	}
+	c.servers[index] = s
+	c.opts[index] = o
+	return s
+}
+
 func (c *cluster) checkClusterFormed() {
 	checkClusterFormed(c.t, c.servers...)
+}
+
+func (c *cluster) waitOnPeerCount(n int) {
+	c.t.Helper()
+	c.waitOnLeader()
+	leader := c.leader()
+	expires := time.Now().Add(5 * time.Second)
+	for time.Now().Before(expires) {
+		peers := leader.JetStreamClusterPeers()
+		if len(peers) == n {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	c.t.Fatalf("Expected a cluster peer count of %d, got %d", n, len(leader.JetStreamClusterPeers()))
 }
 
 func (c *cluster) waitOnNewConsumerLeader(account, stream, consumer string) {
@@ -591,6 +804,40 @@ func (c *cluster) consumerLeader(account, stream, consumer string) *server.Serve
 		}
 	}
 	return nil
+}
+
+func (c *cluster) waitOnNewStreamLeader(account, stream string) {
+	c.t.Helper()
+	expires := time.Now().Add(5 * time.Second)
+	for time.Now().Before(expires) {
+		if leader := c.streamLeader(account, stream); leader != nil {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	c.t.Fatalf("Expected a stream leader for %q %q, got none", account, stream)
+}
+
+func (c *cluster) streamLeader(account, stream string) *server.Server {
+	c.t.Helper()
+	for _, s := range c.servers {
+		if s.JetStreamIsStreamLeader(account, stream) {
+			return s
+		}
+	}
+	return nil
+}
+
+func (c *cluster) waitOnServerCurrent(s *server.Server) {
+	c.t.Helper()
+	expires := time.Now().Add(5 * time.Second)
+	for time.Now().Before(expires) {
+		if s.JetStreamIsCurrent() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	c.t.Fatalf("Expected server %q to eventually be current", s)
 }
 
 func (c *cluster) randomNonLeader() *server.Server {

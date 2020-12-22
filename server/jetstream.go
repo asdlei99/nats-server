@@ -173,6 +173,15 @@ func (s *Server) EnableJetStream(config *JetStreamConfig) error {
 		}
 	}
 
+	// If we are in clustered mode go ahead and start the meta controller.
+	if !s.standAloneMode() {
+		s.Warnf("JetStream Cluster is ALPHA")
+		if err := s.enableJetStreamClustering(); err != nil {
+			s.Errorf("Could not create JetStream cluster: %v", err)
+			return err
+		}
+	}
+
 	// If we have no configured accounts setup then setup imports on global account.
 	if s.globalAccountOnly() {
 		if err := s.GlobalAccount().EnableJetStream(nil); err != nil {
@@ -180,14 +189,6 @@ func (s *Server) EnableJetStream(config *JetStreamConfig) error {
 		}
 	} else if err := s.configAllJetStreamAccounts(); err != nil {
 		return fmt.Errorf("Error enabling jetstream on configured accounts: %v", err)
-	}
-
-	if !s.standAloneMode() {
-		s.Warnf("JetStream Cluster is ALPHA")
-		if err := s.enableJetStreamClustering(); err != nil {
-			s.Errorf("Could not create JetStream cluster: %v", err)
-			return err
-		}
 	}
 
 	return nil

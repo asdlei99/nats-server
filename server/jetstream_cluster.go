@@ -22,6 +22,7 @@ import (
 	"math/rand"
 	"path"
 
+	"github.com/klauspost/compress/s2"
 	"github.com/nats-io/nuid"
 )
 
@@ -51,6 +52,7 @@ const (
 	// Consumer ops
 	updateDeliveredOp
 	updateAcksOp
+	updateFullStateOp
 )
 
 // raftGroup are controlled by the metagroup controller. The raftGroups will
@@ -89,8 +91,8 @@ type streamPurge struct {
 // consumerAssignment is what the meta controller uses to assign consumers to streams.
 type consumerAssignment struct {
 	Client *ClientInfo     `json:"client,omitempty"`
+	Name   string          `json:"name"`
 	Stream string          `json:"stream"`
-	Name   string          `json:"name,omitempty"`
 	Config *ConsumerConfig `json:"consumer"`
 	Group  *raftGroup      `json:"group"`
 	Reply  string          `json:"reply"`
@@ -160,6 +162,30 @@ func (s *Server) JetStreamIsLeader() bool {
 	return js.cluster.isLeader()
 }
 
+func (s *Server) JetStreamIsCurrent() bool {
+	js := s.getJetStream()
+	if js == nil {
+		return false
+	}
+	js.mu.RLock()
+	defer js.mu.RUnlock()
+	return js.cluster.isCurrent()
+}
+
+func (s *Server) JetStreamSnapshotMeta() error {
+	js := s.getJetStream()
+	if js == nil {
+		return ErrJetStreamNotEnabled
+	}
+	js.mu.RLock()
+	defer js.mu.RUnlock()
+	cc := js.cluster
+	if !cc.isLeader() {
+		return errNotLeader
+	}
+	return cc.meta.Snapshot(js.metaSnapshot())
+}
+
 func (s *Server) JetStreamClusterPeers() []string {
 	js := s.getJetStream()
 	if js == nil {
@@ -186,8 +212,17 @@ func (cc *jetStreamCluster) isLeader() bool {
 		// Non-clustered mode
 		return true
 	}
-	// FIXME(dlc) - Make this real and bootstrap manually with peers.
 	return cc.meta.Leader()
+}
+
+// isCurrent will determine if this node is a leader or an up to date follower.
+// Read lock should be held.
+func (cc *jetStreamCluster) isCurrent() bool {
+	if cc == nil {
+		// Non-clustered mode
+		return true
+	}
+	return cc.meta.Current()
 }
 
 func (a *Account) getJetStreamFromAccount() (*Server, *jetStream, *jsAccount) {
@@ -292,7 +327,7 @@ func (js *jetStream) setupMetaGroup() error {
 	fmt.Printf("cluster name is stable, numConfiguredRoutes is %d\n", s.configuredRoutes())
 
 	// Setup our WAL for the metagroup.
-	stateDir := path.Join(js.config.StoreDir, s.SystemAccount().Name, defaultStoreDirName, defaultMetaGroupName)
+	stateDir := path.Join(js.config.StoreDir, defaultStoreDirName, defaultMetaGroupName)
 	fs, bootstrap, err := newFileStore(
 		FileStoreConfig{StoreDir: stateDir, BlockSize: defaultMetaFSBlkSize},
 		StreamConfig{Name: defaultMetaGroupName, Storage: FileStorage},
@@ -302,14 +337,23 @@ func (js *jetStream) setupMetaGroup() error {
 		return err
 	}
 
+	cfg := &RaftConfig{Name: defaultMetaGroupName, Store: stateDir, Log: fs}
+
 	if bootstrap {
 		s.Noticef("JetStream cluster bootstrapping")
-		fmt.Printf("Bootstrapping: active routes is %d\n", len(s.routes))
 		// FIXME(dlc) - Make this real.
+		peers := s.activePeers()
+		s.Debugf("JetStream cluster initial peers: %+v", peers)
+		fmt.Printf("JetStream cluster initial peers: %+v\n", peers)
+		s.bootstrapRaftNode(cfg, peers, false)
+	} else {
+		fmt.Printf("[%s] Recovering state from %q\n", s, stateDir)
+		s.Noticef("JetStream cluster recovering state")
 	}
-
-	n, err := s.newRaftGroup(defaultMetaGroupName, stateDir, fs)
+	// Start up our meta node.
+	n, err := s.startRaftNode(cfg)
 	if err != nil {
+		fmt.Printf("\nCould not start RAFT!! %v\n\n", err)
 		return err
 	}
 
@@ -455,7 +499,9 @@ func (js *jetStream) monitorCluster() {
 		case <-qch:
 			return
 		case ce := <-ach:
+			// FIXME(dlc) - Deal with errors.
 			js.applyMetaEntries(ce.Entries)
+			//js.writeMetaState(ce.Index)
 			n.Applied(ce.Index)
 		case isLeader := <-lch:
 			js.processLeaderChange(isLeader)
@@ -463,46 +509,183 @@ func (js *jetStream) monitorCluster() {
 	}
 }
 
-// FIXME(dlc) - Return error. Don't apply above if err.
-func (js *jetStream) applyMetaEntries(entries [][]byte) {
-	fmt.Printf("[%s] JS HAS AN ENTRIES UPDATE TO APPLY!\n", js.srv.Name())
+// Represents our stable meta state that we can write out.
+type writeableStreamAssignment struct {
+	Client    *ClientInfo   `json:"client,omitempty"`
+	Config    *StreamConfig `json:"stream"`
+	Group     *raftGroup    `json:"group"`
+	Consumers []*consumerAssignment
+}
 
-	for _, buf := range entries {
-		switch entryOp(buf[0]) {
-		case assignStreamOp:
-			fmt.Printf("[%s] STREAM ASSIGN ENTRY\n", js.srv.Name())
-			sa, err := decodeStreamAssignment(buf[1:])
-			if err != nil {
-				js.srv.Errorf("JetStream cluster failed to decode stream assignment: %q", buf[1:])
-				return
+func (js *jetStream) metaSnapshot() []byte {
+	var streams []writeableStreamAssignment
+	js.mu.RLock()
+	cc := js.cluster
+	for _, asa := range cc.streams {
+		for _, sa := range asa {
+			wsa := writeableStreamAssignment{
+				Client: sa.Client,
+				Config: sa.Config,
+				Group:  sa.Group,
 			}
-			js.processStreamAssignment(sa)
-		case removeStreamOp:
-			fmt.Printf("[%s] REMOVE STREAM ENTRY\n", js.srv.Name())
-			sa, err := decodeStreamAssignment(buf[1:])
-			if err != nil {
-				js.srv.Errorf("JetStream cluster failed to decode stream assignment: %q", buf[1:])
-				return
+			for _, ca := range sa.consumers {
+				wsa.Consumers = append(wsa.Consumers, ca)
 			}
-			js.processStreamRemoval(sa)
-		case assignConsumerOp:
-			fmt.Printf("[%s] CONSUMER ASSIGN ENTRY\n", js.srv.Name())
-			ca, err := decodeConsumerAssignment(buf[1:])
-			if err != nil {
-				js.srv.Errorf("JetStream cluster failed to decode consumer assigment: %q", buf[1:])
-				return
+			streams = append(streams, wsa)
+		}
+	}
+	js.mu.RUnlock()
+
+	if len(streams) == 0 {
+		return nil
+	}
+
+	b, _ := json.Marshal(streams)
+	return s2.EncodeBetter(nil, b)
+}
+
+func (js *jetStream) applyMetaSnapshot(buf []byte) error {
+	jse, err := s2.Decode(nil, buf)
+	if err != nil {
+		return err
+	}
+	var wsas []writeableStreamAssignment
+	if err = json.Unmarshal(jse, &wsas); err != nil {
+		return err
+	}
+	fmt.Printf("[%s] Got snapshot %+v\n", js.srv, wsas)
+	// Build our new version here outside of js.
+	streams := make(map[string]map[string]*streamAssignment)
+	for _, wsa := range wsas {
+		as := streams[wsa.Client.Account]
+		if as == nil {
+			as = make(map[string]*streamAssignment)
+			streams[wsa.Client.Account] = as
+		}
+		sa := &streamAssignment{Client: wsa.Client, Config: wsa.Config, Group: wsa.Group}
+		if len(wsa.Consumers) > 0 {
+			sa.consumers = make(map[string]*consumerAssignment)
+			for _, ca := range wsa.Consumers {
+				sa.consumers[ca.Name] = ca
 			}
+		}
+		as[wsa.Config.Name] = sa
+	}
+	fmt.Printf("Generated clone: %+v\n", streams)
+
+	js.mu.Lock()
+	cc := js.cluster
+
+	var saAdd, saDel, saChk []*streamAssignment
+	// Walk through the old list to generate the delete list.
+	for account, asa := range cc.streams {
+		nasa := streams[account]
+		for sn, sa := range asa {
+			if nsa := nasa[sn]; nsa == nil {
+				saDel = append(saDel, sa)
+				fmt.Printf("[%s] NEED TO REMOVE SA %+v\n", js.srv, sa)
+			} else {
+				saChk = append(saChk, nsa)
+				fmt.Printf("[%s] NEED TO CHECK SA %+v\n", js.srv, nsa)
+			}
+		}
+	}
+	// Walk through the new list to generate the add list.
+	for account, nasa := range streams {
+		asa := cc.streams[account]
+		for sn, sa := range nasa {
+			if asa[sn] == nil {
+				saAdd = append(saAdd, sa)
+				fmt.Printf("[%s] NEED TO ADD SA %+v\n", js.srv, sa)
+			}
+		}
+	}
+	// Now walk the ones to check and process consumers.
+	var caAdd, caDel []*consumerAssignment
+	for _, sa := range saChk {
+		if osa := js.streamAssignment(sa.Client.Account, sa.Config.Name); osa != nil {
+			for _, ca := range osa.consumers {
+				if sa.consumers[ca.Name] == nil {
+					fmt.Printf("[%s] NEED TO REMOVE CA %+v\n", js.srv, ca)
+					caDel = append(caDel, ca)
+				} else {
+					fmt.Printf("[%s] NEED TO ADD CA %+v\n", js.srv, ca)
+					caAdd = append(caAdd, ca)
+				}
+			}
+		}
+	}
+	js.mu.Unlock()
+
+	// Do removals first.
+	for _, sa := range saDel {
+		js.processStreamRemoval(sa)
+	}
+	// Now do add for the streams. Also add in all consumers.
+	for _, sa := range saAdd {
+		js.processStreamAssignment(sa)
+		// We can simply add the consumers.
+		for _, ca := range sa.consumers {
 			js.processConsumerAssignment(ca)
-		case removeConsumerOp:
-			fmt.Printf("[%s] CONSUMER REMOVE ENTRY\n", js.srv.Name())
-			ca, err := decodeConsumerAssignment(buf[1:])
-			if err != nil {
-				js.srv.Errorf("JetStream cluster failed to decode consumer assigment: %q", buf[1:])
-				return
+		}
+	}
+	// Now do the deltas for existing stream's consumers.
+	for _, ca := range caDel {
+		js.processConsumerRemoval(ca)
+	}
+	for _, ca := range caAdd {
+		js.processConsumerAssignment(ca)
+	}
+
+	return nil
+}
+
+// FIXME(dlc) - Return error. Don't apply above if err.
+func (js *jetStream) applyMetaEntries(entries []*Entry) {
+	fmt.Printf("[%s] JS HAS AN ENTRIES UPDATE TO APPLY!\n", js.srv)
+
+	for _, e := range entries {
+		if e.Type == EntrySnapshot {
+			fmt.Printf("[%s] SNAPSHOT META ENTRY\n", js.srv)
+			js.applyMetaSnapshot(e.Data)
+		} else {
+			buf := e.Data
+			switch entryOp(buf[0]) {
+			case assignStreamOp:
+				fmt.Printf("[%s] STREAM ASSIGN ENTRY\n", js.srv)
+				sa, err := decodeStreamAssignment(buf[1:])
+				if err != nil {
+					js.srv.Errorf("JetStream cluster failed to decode stream assignment: %q", buf[1:])
+					return
+				}
+				js.processStreamAssignment(sa)
+			case removeStreamOp:
+				fmt.Printf("[%s] REMOVE STREAM ENTRY\n", js.srv)
+				sa, err := decodeStreamAssignment(buf[1:])
+				if err != nil {
+					js.srv.Errorf("JetStream cluster failed to decode stream assignment: %q", buf[1:])
+					return
+				}
+				js.processStreamRemoval(sa)
+			case assignConsumerOp:
+				fmt.Printf("[%s] CONSUMER ASSIGN ENTRY\n", js.srv)
+				ca, err := decodeConsumerAssignment(buf[1:])
+				if err != nil {
+					js.srv.Errorf("JetStream cluster failed to decode consumer assigment: %q", buf[1:])
+					return
+				}
+				js.processConsumerAssignment(ca)
+			case removeConsumerOp:
+				fmt.Printf("[%s] CONSUMER REMOVE ENTRY\n", js.srv)
+				ca, err := decodeConsumerAssignment(buf[1:])
+				if err != nil {
+					js.srv.Errorf("JetStream cluster failed to decode consumer assigment: %q", buf[1:])
+					return
+				}
+				js.processConsumerRemoval(ca)
+			default:
+				panic("JetStream Cluster Unknown meta entry op type!")
 			}
-			js.processConsumerRemoval(ca)
-		default:
-			panic("JetStream Cluster Unknown meta entry op type!")
 		}
 	}
 }
@@ -557,7 +740,7 @@ func (js *jetStream) createRaftGroup(rg *raftGroup) {
 	}
 
 	stateDir := path.Join(js.config.StoreDir, sysAcc.Name, defaultStoreDirName, rg.Name)
-	fs, _, err := newFileStore(
+	fs, bootstrap, err := newFileStore(
 		FileStoreConfig{StoreDir: stateDir},
 		StreamConfig{Name: rg.Name, Storage: rg.Storage},
 	)
@@ -566,7 +749,13 @@ func (js *jetStream) createRaftGroup(rg *raftGroup) {
 		return
 	}
 	fmt.Printf("[%s] Will create raft group %q for %q\n", s.Name(), rg.Name, stateDir)
-	n, err := s.newRaftGroup(rg.Name, stateDir, fs)
+
+	cfg := &RaftConfig{Name: rg.Name, Store: stateDir, Log: fs}
+
+	if bootstrap {
+		s.bootstrapRaftNode(cfg, rg.Peers, true)
+	}
+	n, err := s.startRaftNode(cfg)
 	if err != nil {
 		fmt.Printf("ERROR CREATING RAFT GROUP!!!%v\n", err)
 		return
@@ -605,7 +794,7 @@ func (js *jetStream) monitorStreamRaftGroup(mset *Stream, sa *streamAssignment) 
 			return
 		case ce := <-ach:
 			// FIXME(dlc) - capture errors.
-			js.applyStreamEntries(mset, ce.Entries)
+			js.applyStreamEntries(mset, ce)
 			n.Applied(ce.Index)
 		case isLeader := <-lch:
 			js.processStreamLeaderChange(mset, sa, isLeader)
@@ -613,44 +802,49 @@ func (js *jetStream) monitorStreamRaftGroup(mset *Stream, sa *streamAssignment) 
 	}
 }
 
-func (js *jetStream) applyStreamEntries(mset *Stream, entries [][]byte) {
+func (js *jetStream) applyStreamEntries(mset *Stream, ce *CommittedEntry) {
 	fmt.Printf("[%s] JS GROUP %q HAS STREAM ENTRIES UPDATE TO APPLY!\n", js.srv.Name(), mset.node.Group())
-	for _, buf := range entries {
-		switch entryOp(buf[0]) {
-		case streamMsgOp:
-			subject, reply, hdr, msg, err := decodeStreamMsg(buf[1:])
-			if err != nil {
-				panic(err.Error())
-			}
-			fmt.Printf("[%s] DECODED %q %q %q %q\n\n", js.srv.Name(), subject, reply, hdr, msg)
-			mset.processJetStreamMsg(subject, reply, hdr, msg)
-		case purgeStreamOp:
-			sp, err := decodeStreamPurge(buf[1:])
-			if err != nil {
-				panic(err.Error())
-			}
-			s := js.server()
-			fmt.Printf("[%s] PURGE DECODED %+v\n\n", js.srv.Name(), sp)
-			purged, err := mset.Purge()
-			if err != nil {
-				s.Warnf("JetStream cluster failed to purge stream %q for account %q: %v", sp.Stream, sp.Client.Account, err)
-			}
-			js.mu.RLock()
-			isLeader := js.cluster.isStreamLeader(sp.Client.Account, sp.Stream)
-			js.mu.RUnlock()
-			if isLeader {
-				fmt.Printf("[%s] PURGED %d, SHOULD RESPOND AS LEADER\n\n", js.srv.Name(), purged)
-				var resp = JSApiStreamPurgeResponse{ApiResponse: ApiResponse{Type: JSApiStreamPurgeResponseType}}
+	for _, e := range ce.Entries {
+		if e.Type == EntrySnapshot {
+			fmt.Printf("[%s] SNAPSHOT STREAM ENTRY\n", js.srv)
+		} else {
+			buf := e.Data
+			switch entryOp(buf[0]) {
+			case streamMsgOp:
+				subject, reply, hdr, msg, err := decodeStreamMsg(buf[1:])
 				if err != nil {
-					resp.Error = jsError(err)
-				} else {
-					resp.Purged = purged
-					resp.Success = true
+					panic(err.Error())
 				}
-				s.sendAPIResponse(sp.Client, mset.account(), _EMPTY_, sp.Reply, _EMPTY_, s.jsonResponse(resp))
+				fmt.Printf("[%s] DECODED %q %q %q %q\n\n", js.srv.Name(), subject, reply, hdr, msg)
+				mset.processJetStreamMsg(subject, reply, hdr, msg)
+			case purgeStreamOp:
+				sp, err := decodeStreamPurge(buf[1:])
+				if err != nil {
+					panic(err.Error())
+				}
+				s := js.server()
+				fmt.Printf("[%s] PURGE DECODED %+v\n\n", js.srv.Name(), sp)
+				purged, err := mset.Purge()
+				if err != nil {
+					s.Warnf("JetStream cluster failed to purge stream %q for account %q: %v", sp.Stream, sp.Client.Account, err)
+				}
+				js.mu.RLock()
+				isLeader := js.cluster.isStreamLeader(sp.Client.Account, sp.Stream)
+				js.mu.RUnlock()
+				if isLeader {
+					fmt.Printf("[%s] PURGED %d, SHOULD RESPOND AS LEADER\n\n", js.srv.Name(), purged)
+					var resp = JSApiStreamPurgeResponse{ApiResponse: ApiResponse{Type: JSApiStreamPurgeResponseType}}
+					if err != nil {
+						resp.Error = jsError(err)
+					} else {
+						resp.Purged = purged
+						resp.Success = true
+					}
+					s.sendAPIResponse(sp.Client, mset.account(), _EMPTY_, sp.Reply, _EMPTY_, s.jsonResponse(resp))
+				}
+			default:
+				panic("JetStream Cluster Unknown group entry op type!")
 			}
-		default:
-			panic("JetStream Cluster Unknown group entry op type!")
 		}
 	}
 }
@@ -879,16 +1073,15 @@ func (js *jetStream) processConsumerAssignment(ca *consumerAssignment) {
 	}
 
 	sa := js.streamAssignment(ca.Client.Account, ca.Stream)
+	if sa == nil {
+		// FIXME(dlc) - log.
+		return
+	}
 	fmt.Printf("[%s] related sa is %+v\n", js.srv.Name(), sa)
 
-	// Check if we have this one already registered.
-	if sa.consumers != nil {
-		if sa.consumers[ca.Name] != nil {
-			// TODO(dlc) - log error
-			js.mu.Unlock()
-			return
-		}
-	} else {
+	// If this one was already here that is ok, we replace with this new one.
+	// When it is added the low level JetStream code will do the right thing.
+	if sa.consumers == nil {
 		sa.consumers = make(map[string]*consumerAssignment)
 	}
 
@@ -924,12 +1117,10 @@ func (js *jetStream) processConsumerRemoval(ca *consumerAssignment) {
 	isMember := ca.Group.isMember(cc.meta.ID())
 	js.mu.Unlock()
 
-	if !isMember {
-		return
+	if isMember {
+		fmt.Printf("Will process remove consumer, since we are a member!!\n")
+		js.processClusterDeleteConsumer(ca)
 	}
-
-	fmt.Printf("Will process remove consumer, since we are a member!!\n")
-	js.processClusterDeleteConsumer(ca)
 }
 
 // processClusterCreateConsumer is when we are a member fo the group and need to create the consumer.
@@ -1099,7 +1290,7 @@ func (js *jetStream) monitorConsumerRaftGroup(o *Consumer, ca *consumerAssignmen
 			return
 		case ce := <-ach:
 			// FIXME(dlc) - capture errors.
-			js.applyConsumerEntries(o, ce.Entries)
+			js.applyConsumerEntries(o, ce)
 			n.Applied(ce.Index)
 		case isLeader := <-lch:
 			js.processConsumerLeaderChange(o, ca, isLeader)
@@ -1107,28 +1298,44 @@ func (js *jetStream) monitorConsumerRaftGroup(o *Consumer, ca *consumerAssignmen
 	}
 }
 
-func (js *jetStream) applyConsumerEntries(o *Consumer, entries [][]byte) {
+func (js *jetStream) applyConsumerEntries(o *Consumer, ce *CommittedEntry) {
 	fmt.Printf("[%s] JS GROUP %q HAS CONSUMER ENTRIES UPDATE TO APPLY!\n", js.srv, o.node.Group())
-	for _, buf := range entries {
-		switch entryOp(buf[0]) {
-		case updateDeliveredOp:
-			dseq, sseq, dc, ts, err := decodeDeliveredUpdate(buf[1:])
-			if err != nil {
-				panic(err.Error())
+	for _, e := range ce.Entries {
+		if e.Type == EntrySnapshot {
+			fmt.Printf("[%s] SNAPSHOT CONSUMER ENTRY\n", js.srv)
+		} else {
+			buf := e.Data
+			switch entryOp(buf[0]) {
+			case updateDeliveredOp:
+				dseq, sseq, dc, ts, err := decodeDeliveredUpdate(buf[1:])
+				if err != nil {
+					panic(err.Error())
+				}
+				if err := o.store.UpdateDelivered(dseq, sseq, dc, ts); err != nil {
+					panic(err.Error())
+				}
+			case updateAcksOp:
+				dseq, sseq, err := decodeAckUpdate(buf[1:])
+				if err != nil {
+					panic(err.Error())
+				}
+				if err := o.store.UpdateAcks(dseq, sseq); err != nil {
+					panic(err.Error())
+				}
+			case updateFullStateOp:
+				state, err := decodeConsumerState(buf[1:])
+				if err != nil {
+					panic(err.Error())
+				}
+				fmt.Printf("\n\nDECODE OF FULL STATE IS %+v\n", state)
+				o.store.Update(state)
+				// We can compact here since this is our complete state.
+				// FIXME(dlc) - Need index though.
+				//o.node.Compact(ce.Index)
+			default:
+				fmt.Printf("OP is %v\n", buf[0])
+				panic("JetStream Cluster Unknown group entry op type!")
 			}
-			if err := o.store.UpdateDelivered(dseq, sseq, dc, ts); err != nil {
-				panic(err.Error())
-			}
-		case updateAcksOp:
-			dseq, sseq, err := decodeAckUpdate(buf[1:])
-			if err != nil {
-				panic(err.Error())
-			}
-			if err := o.store.UpdateAcks(dseq, sseq); err != nil {
-				panic(err.Error())
-			}
-		default:
-			panic("JetStream Cluster Unknown group entry op type!")
 		}
 	}
 }
@@ -1219,17 +1426,23 @@ func (js *jetStream) processLeaderChange(isLeader bool) {
 func (cc *jetStreamCluster) selectPeerGroup(r int) []string {
 	var nodes []string
 	peers := cc.meta.Peers()
-	if len(peers) < r {
-		fmt.Printf("Not enough peers! %d\n", len(peers))
+	// Make sure they are active
+	s := cc.s
+	ourID := cc.meta.ID()
+	for _, p := range peers {
+		if p.ID == ourID || s.getRouteByHash([]byte(p.ID)) != nil {
+			nodes = append(nodes, p.ID)
+		} else {
+			fmt.Printf("peer %q not online!\n", p.ID)
+		}
+	}
+	if len(nodes) < r {
+		fmt.Printf("Not enough active peers! %d\n", len(nodes))
 		return nil
 	}
 	// Don't depend on range.
-	rand.Shuffle(len(peers), func(i, j int) { peers[i], peers[j] = peers[j], peers[i] })
-	for _, p := range peers[:r] {
-		// TODO(dlc) - check last active?
-		nodes = append(nodes, p.ID)
-	}
-	return nodes
+	rand.Shuffle(len(nodes), func(i, j int) { nodes[i], nodes[j] = nodes[j], nodes[i] })
+	return nodes[:r]
 }
 
 func groupNameForStream(peers []string, storage StorageType) string {
@@ -1306,7 +1519,6 @@ func (s *Server) jsClusteredStreamDeleteRequest(ci *ClientInfo, stream, subject,
 		// TODO(dlc) - Should respond? Log?
 		return
 	}
-	fmt.Printf("OSA is %+v\n", osa)
 	sa := &streamAssignment{Group: osa.Group, Config: osa.Config, Reply: reply, Client: ci}
 	cc.meta.Propose(encodeDeleteStreamAssignment(sa))
 }

@@ -244,6 +244,17 @@ func TestMemStoreCompact(t *testing.T) {
 	if state.FirstSeq != 6 {
 		t.Fatalf("Expected first seq of 6, got %d", state.FirstSeq)
 	}
+	// Now test that compact will also reset first if seq > last
+	n, err = ms.Compact(100)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if n != 5 {
+		t.Fatalf("Expected to have purged 5 msgs, got %d", n)
+	}
+	if state = ms.State(); state.FirstSeq != 100 {
+		t.Fatalf("Expected first seq of 100, got %d", state.FirstSeq)
+	}
 }
 
 func TestMemStoreEraseMsg(t *testing.T) {

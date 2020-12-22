@@ -770,6 +770,20 @@ func (s *Server) configuredRoutes() int {
 	return len(s.getOpts().Routes)
 }
 
+// activePeers is used in bootstrapping raft groups like the JetStream meta controller.
+func (s *Server) activePeers() (peers []string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.sys == nil {
+		return nil
+	}
+	for _, r := range s.routes {
+		peers = append(peers, r.route.hash)
+	}
+	return peers
+}
+
 // isTrustedIssuer will check that the issuer is a trusted public key.
 // This is used to make sure an account was signed by a trusted operator.
 func (s *Server) isTrustedIssuer(issuer string) bool {
@@ -996,6 +1010,7 @@ func (s *Server) GlobalAccount() *Account {
 // SetDefaultSystemAccount will create a default system account if one is not present.
 func (s *Server) SetDefaultSystemAccount() error {
 	if _, isNew := s.LookupOrRegisterAccount(DEFAULT_SYSTEM_ACCOUNT); !isNew {
+		fmt.Printf("ALREADY HAS SYSTEM ACCOUNT!\n\n\n")
 		return nil
 	}
 	s.Debugf("Created system account: %q", DEFAULT_SYSTEM_ACCOUNT)
@@ -1562,6 +1577,8 @@ func (s *Server) Start() {
 // Shutdown will shutdown the server instance by kicking out the AcceptLoop
 // and closing all associated clients.
 func (s *Server) Shutdown() {
+	// Shutdown our raftnodes. If we are the leader we will attempt to transfer.
+	s.shutdownRaftNodes()
 	// Shutdown the eventing system as needed.
 	// This is done first to send out any messages for
 	// account status. We will also clean up any

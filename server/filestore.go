@@ -2442,32 +2442,56 @@ func (fs *fileStore) Compact(seq uint64) (uint64, error) {
 		return fs.Purge()
 	}
 
-	if _, err := fs.msgForSeq(seq); err != nil {
-		return 0, err
-	}
-
+	// TODO(dlc) - We can be smarter for large compactions and drop whole msg blocks.
 	var purged uint64
-	for fseq := fs.firstSeq(); fseq < seq; fseq = fs.firstSeq() {
-		if found, err := fs.removeMsg(fseq, false); err != nil {
-			if err == ErrStoreMsgNotFound {
-				continue
-			} else if err == ErrStoreEOF {
-				err = nil
+	if last := fs.lastSeq(); seq <= last {
+		for fseq := fs.firstSeq(); fseq < seq; fseq = fs.firstSeq() {
+			if found, err := fs.removeMsg(fseq, false); err != nil {
+				if err == ErrStoreMsgNotFound {
+					continue
+				} else if err == ErrStoreEOF {
+					err = nil
+				}
+				return purged, err
+			} else if found {
+				purged++
 			}
-			return purged, err
-		} else if found {
-			purged++
 		}
+	} else {
+		// We are compacting past the end of our range. Do purge and set sequences correctly
+		// such that the next message placed will have seq.
+		var err error
+		if purged, err = fs.Purge(); err != nil {
+			return 0, err
+		}
+		fs.resetFirst(seq)
 	}
 
 	return purged, nil
 }
 
+func (fs *fileStore) resetFirst(newFirst uint64) {
+	fs.mu.Lock()
+	fs.state.FirstSeq = newFirst
+	fs.state.LastSeq = newFirst - 1
+	fs.lmb.first.seq = fs.state.FirstSeq
+	fs.lmb.last.seq = fs.state.LastSeq
+	fs.lmb.writeIndexInfo()
+	fs.mu.Unlock()
+}
+
 func (fs *fileStore) firstSeq() uint64 {
 	fs.mu.RLock()
-	fseq := fs.state.FirstSeq
+	seq := fs.state.FirstSeq
 	fs.mu.RUnlock()
-	return fseq
+	return seq
+}
+
+func (fs *fileStore) lastSeq() uint64 {
+	fs.mu.RLock()
+	seq := fs.state.LastSeq
+	fs.mu.RUnlock()
+	return seq
 }
 
 // Returns number of msg blks.

@@ -1108,8 +1108,15 @@ func (o *Consumer) writeState() {
 			Pending:     o.pending,
 			Redelivered: o.rdc,
 		}
-		// FIXME(dlc) - Hold onto any errors.
-		o.store.Update(&state)
+		if o.node != nil {
+			// Not fast path, so copy ok for now.
+			var b = [64]byte{byte(updateFullStateOp)}
+			buf := append(b[:1], encodeConsumerState(&state)...)
+			o.node.Propose(buf)
+		} else {
+			// FIXME(dlc) - Hold onto any errors.
+			o.store.Update(&state)
+		}
 	}
 	o.mu.Unlock()
 }

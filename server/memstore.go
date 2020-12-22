@@ -280,29 +280,43 @@ func (ms *memStore) Compact(seq uint64) (uint64, error) {
 	if seq == 0 {
 		return ms.Purge()
 	}
-	ms.mu.Lock()
-	sm, ok := ms.msgs[seq]
-	if !ok {
-		ms.mu.Unlock()
-		return 0, ErrStoreMsgNotFound
-	}
-	ms.state.FirstSeq = seq
-	ms.state.FirstTime = time.Unix(0, sm.ts).UTC()
 
 	var purged, bytes uint64
-	for seq := seq - 1; seq > 0; seq-- {
-		sm := ms.msgs[seq]
-		if sm == nil {
-			continue
-		}
-		bytes += memStoreMsgSize(sm.subj, sm.hdr, sm.msg)
-		purged++
-		delete(ms.msgs, seq)
-	}
-	ms.state.Msgs -= purged
-	ms.state.Bytes -= bytes
 
+	ms.mu.Lock()
 	cb := ms.scb
+	if seq <= ms.state.LastSeq {
+		sm, ok := ms.msgs[seq]
+		if !ok {
+			ms.mu.Unlock()
+			return 0, ErrStoreMsgNotFound
+		}
+		ms.state.FirstSeq = seq
+		ms.state.FirstTime = time.Unix(0, sm.ts).UTC()
+
+		for seq := seq - 1; seq > 0; seq-- {
+			sm := ms.msgs[seq]
+			if sm == nil {
+				continue
+			}
+			bytes += memStoreMsgSize(sm.subj, sm.hdr, sm.msg)
+			purged++
+			delete(ms.msgs, seq)
+		}
+		ms.state.Msgs -= purged
+		ms.state.Bytes -= bytes
+	} else {
+		// We are compacting past the end of our range. Do purge and set sequences correctly
+		// such that the next message placed will have seq.
+		purged = uint64(len(ms.msgs))
+		bytes = ms.state.Bytes
+		ms.state.Bytes = 0
+		ms.state.Msgs = 0
+		ms.state.FirstSeq = seq
+		ms.state.FirstTime = time.Time{}
+		ms.state.LastSeq = seq - 1
+		ms.msgs = make(map[uint64]*storedMsg)
+	}
 	ms.mu.Unlock()
 
 	if cb != nil {
