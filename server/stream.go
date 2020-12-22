@@ -16,7 +16,6 @@ package server
 import (
 	"archive/tar"
 	"bytes"
-	"compress/gzip"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -31,6 +30,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/klauspost/compress/s2"
 	"github.com/nats-io/nuid"
 )
 
@@ -250,7 +250,6 @@ func (mset *Stream) setLeader(isLeader bool) {
 	mset.mu.Lock()
 	// If we are here we have a change in leader status.
 	if isLeader {
-		fmt.Printf("[%s] - SETUP INTERNAL SUBSCRIPTION(s) for stream %q\n\n", mset.client.srv.Name(), mset.config.Name)
 		// Setup subscriptions
 		if err := mset.subscribeToStream(); err != nil {
 			mset.mu.Unlock()
@@ -981,9 +980,6 @@ func (mset *Stream) isClustered() bool {
 
 // processInboundJetStreamMsg handles processing messages bound for a stream.
 func (mset *Stream) processInboundJetStreamMsg(_ *subscription, pc *client, subject, reply string, rmsg []byte) {
-	fmt.Printf("pc is %v\n", pc)
-	fmt.Printf("[%s] GOT INBOUND STREAM MSG! \n", pc.srv.Name())
-
 	hdr, msg := pc.msgParts(rmsg)
 
 	mset.mu.RLock()
@@ -1536,12 +1532,7 @@ func (a *Account) RestoreStream(stream string, r io.Reader) (*Stream, error) {
 		}
 	}
 
-	gzr, err := gzip.NewReader(r)
-	if err != nil {
-		return nil, err
-	}
-	defer gzr.Close()
-	tr := tar.NewReader(gzr)
+	tr := tar.NewReader(s2.NewReader(r))
 
 	for {
 		hdr, err := tr.Next()

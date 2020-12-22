@@ -594,7 +594,6 @@ func (o *Consumer) setLeader(isLeader bool) {
 
 	// If we are here we have a change in leader status.
 	if isLeader {
-		fmt.Printf("[%s] - SETUP for consumer becoming leader %q\n\n", o.acc.srv.Name(), o.name)
 		if isRunning {
 			fmt.Printf("[%s] - Consumer setLeader(true) but was already up and running!\n", o.acc.srv.Name())
 			return

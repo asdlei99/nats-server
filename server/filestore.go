@@ -17,7 +17,6 @@ import (
 	"archive/tar"
 	"bufio"
 	"bytes"
-	"compress/gzip"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
@@ -36,6 +35,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/klauspost/compress/s2"
 	"github.com/minio/highwayhash"
 )
 
@@ -2658,10 +2658,10 @@ func (fs *fileStore) streamSnapshot(w io.WriteCloser, blks []*msgBlock, includeC
 	bw := bufio.NewWriter(w)
 	defer bw.Flush()
 
-	gzw, _ := gzip.NewWriterLevel(bw, gzip.BestSpeed)
-	defer gzw.Close()
+	enc := s2.NewWriter(bw)
+	defer enc.Close()
 
-	tw := tar.NewWriter(gzw)
+	tw := tar.NewWriter(enc)
 	defer tw.Close()
 
 	defer func() {
