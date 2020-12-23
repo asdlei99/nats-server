@@ -1533,7 +1533,6 @@ func (a *Account) RestoreStream(stream string, r io.Reader) (*Stream, error) {
 	}
 
 	tr := tar.NewReader(s2.NewReader(r))
-
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {

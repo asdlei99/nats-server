@@ -445,7 +445,6 @@ func (cc *jetStreamCluster) isStreamLeader(account, stream string) bool {
 	}
 	// Check if we are the leader of this raftGroup assigned to the stream.
 	ourID := cc.meta.ID()
-	fmt.Printf("[%s] ourId for isStreamLeader is %q\n", cc.s, ourID)
 	for _, peer := range rg.Peers {
 		if peer == ourID {
 			if len(rg.Peers) == 1 || rg.node.Leader() {

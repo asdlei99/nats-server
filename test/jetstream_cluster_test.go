@@ -75,7 +75,7 @@ func createJetStreamClusterExplicit(t *testing.T, clusterName string, numServers
 	c.checkClusterFormed()
 	c.waitOnClusterReady()
 
-	fmt.Printf("\n\nCLUSTER FORMED AND READY!\n")
+	fmt.Printf("\n\nCLUSTER FORMED AND READY!\n\n")
 
 	return c
 }
@@ -799,32 +799,54 @@ func TestJetStreamClusterStreamCatchup(t *testing.T) {
 		t.Fatalf("Unexpected error: %v", err)
 	}
 
-	msg, toSend := []byte("Hello JS Clustering"), 10
-	for i := 0; i < toSend; i++ {
+	toSend := 2
+	for i := 1; i <= toSend; i++ {
+		msg := []byte(fmt.Sprintf("HELLO JSC-%d", i))
 		if _, err = js.Publish("foo", msg); err != nil {
 			t.Fatalf("Unexpected publish error: %v", err)
 		}
 	}
 
 	sl := c.streamLeader("$G", "TEST")
+
 	fmt.Printf("\n\nSHUTDOWN STREAM LEADER %v\n\n", sl)
 
 	sl.Shutdown()
 	c.waitOnNewStreamLeader("$G", "TEST")
 
-	// Send 10 more..
-	for i := 0; i < toSend; i++ {
+	fmt.Printf("\n\nSEND MORE MESSAGES\n\n")
+
+	// Send 10 more while one replica offline.
+	for i := toSend; i <= toSend*2; i++ {
+		msg := []byte(fmt.Sprintf("HELLO JSC-%d", i))
 		if _, err = js.Publish("foo", msg); err != nil {
 			t.Fatalf("Unexpected publish error: %v", err)
 		}
 	}
 
+	fmt.Printf("\n\nDELETING MSG %v\n\n", toSend)
+
+	// Delete the first from the second batch.
+	// Now delete a msg.
+	dreq := server.JSApiMsgDeleteRequest{Seq: uint64(toSend)}
+	dreqj, err := json.Marshal(dreq)
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	resp, _ := nc.Request(fmt.Sprintf(server.JSApiMsgDeleteT, "TEST"), dreqj, time.Second)
+	var delMsgResp server.JSApiMsgDeleteResponse
+	if err = json.Unmarshal(resp.Data, &delMsgResp); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+	if !delMsgResp.Success || delMsgResp.Error != nil {
+		t.Fatalf("Got a bad response %+v", delMsgResp.Error)
+	}
+
 	fmt.Printf("\n\nRESTART OLD STREAM LEADER %v\n\n", sl)
+
 	c.restartServer(sl)
 	c.checkClusterFormed()
-
-	time.Sleep(time.Second)
-	// FIXME(dlc)
+	c.waitOnServerCurrent(sl)
 }
 
 func (c *cluster) restartServer(rs *server.Server) *server.Server {

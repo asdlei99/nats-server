@@ -2651,7 +2651,7 @@ func (fs *fileStore) Stop() error {
 
 const errFile = "errors.txt"
 
-// Stream our snapshot through gzip and tar.
+// Stream our snapshot through S2 compression and tar.
 func (fs *fileStore) streamSnapshot(w io.WriteCloser, blks []*msgBlock, includeConsumers bool) {
 	defer w.Close()
 
@@ -2724,7 +2724,7 @@ func (fs *fileStore) streamSnapshot(w io.WriteCloser, blks []*msgBlock, includeC
 		return
 	}
 
-	// Can't use join path here, zip only recognizes relative paths with forward slashes.
+	// Can't use join path here, tar only recognizes relative paths with forward slashes.
 	msgPre := msgDir + "/"
 
 	// Now do messages themselves.

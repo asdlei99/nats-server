@@ -104,7 +104,7 @@ const (
 	DiscardNew
 )
 
-// StreamStats is information about the given stream.
+// StreamState is information about the given stream.
 type StreamState struct {
 	Msgs      uint64    `json:"messages"`
 	Bytes     uint64    `json:"bytes"`

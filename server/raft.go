@@ -215,12 +215,12 @@ func (s *Server) startRaftNode(cfg *RaftConfig) (RaftNode, error) {
 	}
 
 	if state := n.wal.State(); state.Msgs > 0 {
-		// TODO(dlc) - Recover state here.
+		// TODO(dlc) - Recover our state here.
 		if last, err := n.loadLastEntry(); err == nil {
 			n.debug("Recovered %+v\n", state)
 			n.debug("Loaded last ae from index %d: %+v\n", state.LastSeq, last)
-			n.pterm = last.term
-			n.pindex = state.LastSeq
+			//n.pterm = last.term
+			//n.pindex = state.LastSeq
 		}
 		// Replay the log.
 		// Since doing this in place we need to make sure we have enough room on the applyc.
@@ -229,8 +229,13 @@ func (s *Server) startRaftNode(cfg *RaftConfig) (RaftNode, error) {
 			n.applyc = make(chan *CommittedEntry, state.Msgs)
 		}
 		for index := state.FirstSeq; index <= state.LastSeq; index++ {
-			n.debug("Applying %d on startup\n", index)
-			n.apply(index)
+			ae, err := n.loadEntry(index)
+			if err != nil {
+				n.debug("Could not load WAL entry %d on startup!\n")
+				panic("err loading index")
+			}
+			n.debug("Processing %d on startup\n", index)
+			n.processAppendEntry(ae, nil)
 		}
 	}
 
@@ -384,17 +389,6 @@ func (n *raft) Snapshot(snap []byte) error {
 	}
 
 	return nil
-}
-
-// Compact the WAL up to the given index.
-func (n *raft) _Compact(index uint64) error {
-	n.Lock()
-	defer n.Unlock()
-	if index > n.applied {
-		return errors.New("raft: compaction index > comitted")
-	}
-	_, err := n.wal.Compact(index)
-	return err
 }
 
 // Leader returns if we are the leader for our group.
@@ -789,6 +783,7 @@ func (n *raft) decodeAppendEntryResponse(msg []byte) *appendEntryResponse {
 
 func (n *raft) runAsLeader() {
 	n.debug("LEADER!\n")
+	n.debug("Commit is %d\n", n.commit)
 
 	n.sendPeerState()
 
@@ -988,7 +983,6 @@ func (n *raft) loadEntry(index uint64) (*appendEntry, error) {
 func (n *raft) apply(index uint64) {
 	n.commit = index
 	if n.state == Leader {
-		n.debug("We have consensus on %d!!\n", index)
 		delete(n.acks, index)
 	}
 	// FIXME(dlc) - Can keep this in memory if this too slow.
@@ -1007,6 +1001,12 @@ func (n *raft) apply(index uint64) {
 		case EntrySnapshot:
 			n.debug("SNAPSHOT ENTRY TO PROCESS! %+v\n", ae)
 			committed = append(committed, e)
+		case EntryPeerState:
+			if ps, err := decodePeerState(e.Data); err == nil {
+				n.processPeerState(ps)
+			} else {
+				n.debug("Got an err!!! %v\n", err)
+			}
 		case EntryAddPeer:
 			newPeer := string(e.Data)
 			n.debug("COMMITTED NEW PEER! %q\n", newPeer)
@@ -1033,7 +1033,7 @@ func (n *raft) trackResponse(ar *appendEntryResponse) {
 
 	// If we are tracking this peer as a catchup follower, update that here.
 	if indexUpdateC := n.progress[ar.peer]; indexUpdateC != nil {
-		n.debug("Trackresponse needs to update our cacthup follower!\n")
+		n.debug("Trackresponse needs to update our catchup follower!\n")
 		indexUpdateC <- ar.index + 1
 	}
 
@@ -1048,8 +1048,16 @@ func (n *raft) trackResponse(ar *appendEntryResponse) {
 	if results := n.acks[ar.index]; results != nil {
 		results[ar.peer] = struct{}{}
 		if nr := len(results); nr >= n.qn {
-			n.apply(ar.index)
-			sendHB = len(n.propc) == 0
+			// We have a quorum.
+			// FIXME(dlc) - Make sure this is next in line.
+			n.debug("We have consensus on %d, commit is %d!!\n", ar.index, n.commit)
+			if ar.index == n.commit+1 {
+				n.debug("Applying %d\n", ar.index)
+				n.apply(ar.index)
+				sendHB = len(n.propc) == 0
+			} else {
+				n.debug("\n\n############## CONSENSUS BUT CAN'T COMMIT!\n\n")
+			}
 		}
 	}
 	n.Unlock()
@@ -1129,22 +1137,30 @@ func (n *raft) runAsCandidate() {
 	}
 }
 
-// handleAppendEntry handles and append entry from the wire. We can't rely on msg being available
-// past this callback so will do a bunch of procesing here to avoid copies, channels etc.
+// handleAppendEntry handles an append entry from the wire. We can't rely on msg being available
+// past this callback so will do a bunch of processing here to avoid copies, channels etc.
 func (n *raft) handleAppendEntry(sub *subscription, c *client, subject, reply string, msg []byte) {
 	ae := n.decodeAppendEntry(msg, reply)
 	if ae == nil {
 		n.debug("BAD AE received!")
 		return
 	}
+	n.processAppendEntry(ae, sub)
+}
 
+// processAppendEntry will process an appendEntry.
+func (n *raft) processAppendEntry(ae *appendEntry, sub *subscription) {
 	n.Lock()
 
+	isOriginal := sub != nil
+
 	// Track leader directly
-	n.peers[ae.leader] = time.Now().UnixNano()
+	if isOriginal && ae.leader != noLeader {
+		n.peers[ae.leader] = time.Now().UnixNano()
+	}
 
 	n.debug("Processing AE INLINE %+v\n", ae)
-	if n.catchup == sub {
+	if n.catchup != nil && n.catchup == sub {
 		n.debug("AE is catchup! %+v\n", ae)
 	}
 
@@ -1236,29 +1252,33 @@ func (n *raft) handleAppendEntry(sub *subscription, c *client, subject, reply st
 
 	// Save to our WAL if we have entries.
 	if len(ae.entries) > 0 {
-		if err := n.storeToWAL(ae); err != nil {
-			n.debug("Error storing to WAL: %v\n", err)
-			if err == ErrStoreClosed {
-				n.Unlock()
-				return
+		// Only store if an original which will have sub != nil
+		if isOriginal {
+			if err := n.storeToWAL(ae); err != nil {
+				n.debug("Error storing to WAL: %v\n", err)
+				if err == ErrStoreClosed {
+					n.Unlock()
+					return
+				}
+				panic("Error storing!\n")
 			}
-			panic("Error storing!\n")
+		} else {
+			// This is a replay on startup so just take the appendEntry version.
+			n.pterm = ae.term
+			n.pindex = ae.pindex + 1
 		}
+
 		// Check to see if we have any peer related entries to process here.
 		for _, e := range ae.entries {
 			switch e.Type {
-			case EntryPeerState:
-				if ps, err := decodePeerState(e.Data); err == nil {
-					n.processPeerState(ps)
-				} else {
-					n.debug("Got an err!!! %v\n", err)
-				}
 			case EntryLeaderTransfer:
 				maybeLeader := string(e.Data)
 				if maybeLeader == n.id {
 					n.debug("Received transfer request for %q which is US!\n", e.Data)
 					n.campaign()
 				}
+				// These will not have commits follow them.
+				n.commit = ae.pindex + 1
 			case EntryAddPeer:
 				newPeer := string(e.Data)
 				if len(newPeer) == idLen {
@@ -1274,6 +1294,7 @@ func (n *raft) handleAppendEntry(sub *subscription, c *client, subject, reply st
 	// Apply anything we need here.
 	if ae.commit > n.commit {
 		for index := n.commit + 1; index <= ae.commit; index++ {
+			n.debug("Apply commit for %d\n", index)
 			n.apply(index)
 		}
 	}
@@ -1323,7 +1344,7 @@ func (n *raft) storeToWAL(ae *appendEntry) error {
 	if err != nil {
 		return err
 	}
-	n.debug("StoreToWAL called, term %d index %d\n", n.term, seq)
+	n.debug("StoreToWAL called, term %d index %d - %q\n", n.term, seq, ae.buf[:32])
 	n.debug("WAL state is %+v\n", n.wal.State())
 	n.pterm = ae.term
 	n.pindex = seq
