@@ -996,12 +996,14 @@ func (mset *Stream) processInboundJetStreamMsg(_ *subscription, pc *client, subj
 	if isClustered {
 		mset.processClusteredInboundMsg(subject, reply, hdr, msg)
 	} else {
-		mset.processJetStreamMsg(subject, reply, hdr, msg)
+		mset.processJetStreamMsg(subject, reply, hdr, msg, 0)
 	}
 }
 
+var errLastSeqMismatch = errors.New("last sequence mismatch")
+
 // processJetStreamMsg is where we try to actually process the stream msg.
-func (mset *Stream) processJetStreamMsg(subject, reply string, hdr, msg []byte) {
+func (mset *Stream) processJetStreamMsg(subject, reply string, hdr, msg []byte, lseq uint64) error {
 	mset.mu.Lock()
 	store := mset.store
 	c := mset.client
@@ -1024,6 +1026,13 @@ func (mset *Stream) processJetStreamMsg(subject, reply string, hdr, msg []byte) 
 
 	var resp = &JSPubAckResponse{}
 
+	// For clustering the lower layers will pass our expected lseq. If it is present check for that here.
+	// This is from the clustering layers so will not respond here.
+	if lseq > 0 && lseq != mset.lseq {
+		mset.mu.Unlock()
+		return errLastSeqMismatch
+	}
+
 	// Process msg headers if present.
 	var msgId string
 	if len(hdr) > 0 {
@@ -1036,7 +1045,7 @@ func (mset *Stream) processJetStreamMsg(subject, reply string, hdr, msg []byte) 
 				response = append(response, ",\"duplicate\": true}"...)
 				sendq <- &jsPubMsg{reply, _EMPTY_, _EMPTY_, nil, response, nil, 0}
 			}
-			return
+			return errors.New("msgid is duplicate")
 		}
 		// Expected stream.
 		if sname := getExpectedStream(hdr); sname != _EMPTY_ && sname != name {
@@ -1047,19 +1056,19 @@ func (mset *Stream) processJetStreamMsg(subject, reply string, hdr, msg []byte) 
 				b, _ := json.Marshal(resp)
 				sendq <- &jsPubMsg{reply, _EMPTY_, _EMPTY_, nil, b, nil, 0}
 			}
-			return
+			return errors.New("expected stream does not match")
 		}
 		// Expected last sequence.
 		if seq := getExpectedLastSeq(hdr); seq > 0 && seq != mset.lseq {
-			lseq := mset.lseq
+			mlseq := mset.lseq
 			mset.mu.Unlock()
 			if canRespond {
 				resp.PubAck = &PubAck{Stream: name}
-				resp.Error = &ApiError{Code: 400, Description: fmt.Sprintf("wrong last sequence: %d", lseq)}
+				resp.Error = &ApiError{Code: 400, Description: fmt.Sprintf("wrong last sequence: %d", mlseq)}
 				b, _ := json.Marshal(resp)
 				sendq <- &jsPubMsg{reply, _EMPTY_, _EMPTY_, nil, b, nil, 0}
 			}
-			return
+			return fmt.Errorf("last sequence mismatch: %d vs %d", seq, mlseq)
 		}
 		// Expected last msgId.
 		if lmsgId := getExpectedLastMsgId(hdr); lmsgId != _EMPTY_ && lmsgId != mset.lmsgId {
@@ -1071,13 +1080,13 @@ func (mset *Stream) processJetStreamMsg(subject, reply string, hdr, msg []byte) 
 				b, _ := json.Marshal(resp)
 				sendq <- &jsPubMsg{reply, _EMPTY_, _EMPTY_, nil, b, nil, 0}
 			}
-			return
+			return fmt.Errorf("last msgid mismatch: %q vs %q", lmsgId, last)
 		}
 	}
 
 	if c == nil {
 		mset.mu.Unlock()
-		return
+		return nil
 	}
 
 	// Response Ack.
@@ -1097,7 +1106,7 @@ func (mset *Stream) processJetStreamMsg(subject, reply string, hdr, msg []byte) 
 			b, _ := json.Marshal(resp)
 			mset.sendq <- &jsPubMsg{reply, _EMPTY_, _EMPTY_, nil, b, nil, 0}
 		}
-		return
+		return ErrMaxPayload
 	}
 
 	var noInterest bool
@@ -1133,7 +1142,7 @@ func (mset *Stream) processJetStreamMsg(subject, reply string, hdr, msg []byte) 
 		if msgId != _EMPTY_ {
 			mset.storeMsgId(&ddentry{msgId, seq, time.Now().UnixNano()})
 		}
-		return
+		return nil
 	}
 
 	// If here we will attempt to store the message.
@@ -1209,6 +1218,8 @@ func (mset *Stream) processJetStreamMsg(subject, reply string, hdr, msg []byte) 
 			}
 		}
 	}
+
+	return nil
 }
 
 // Internal message for use by jetstream subsystem.

@@ -1170,6 +1170,16 @@ func (s *Server) jsMsgDeleteRequest(sub *subscription, c *client, subject, reply
 		return
 	}
 
+	stream := tokenAt(subject, 6)
+
+	// If we are in clustered mode we need to be the stream leader to proceed.
+	if s.JetStreamIsClustered() && !acc.JetStreamIsStreamLeader(stream) {
+		fmt.Printf("[%s] MsgDelete skipping this server, not leader!!!\n", s.Name())
+		return
+	}
+
+	fmt.Printf("[%s] Will process MsgDelete since we are stream leader!!!\n", s)
+
 	var resp = JSApiMsgDeleteResponse{ApiResponse: ApiResponse{Type: JSApiMsgDeleteResponseType}}
 	if !acc.JetStreamEnabled() {
 		resp.Error = jsNotEnabledErr
@@ -1188,7 +1198,6 @@ func (s *Server) jsMsgDeleteRequest(sub *subscription, c *client, subject, reply
 		return
 	}
 
-	stream := tokenAt(subject, 6)
 	mset, err := acc.LookupStream(stream)
 	if err != nil {
 		resp.Error = jsNotFoundError(err)
@@ -1196,17 +1205,19 @@ func (s *Server) jsMsgDeleteRequest(sub *subscription, c *client, subject, reply
 		return
 	}
 
+	if s.JetStreamIsClustered() {
+		s.jsClusteredMsgDeleteRequest(ci, stream, subject, reply, req.Seq, rmsg)
+		return
+	}
+
 	removed, err := mset.EraseMsg(req.Seq)
 	if err != nil {
 		resp.Error = jsError(err)
-		s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
-		return
 	} else if !removed {
 		resp.Error = &ApiError{Code: 400, Description: fmt.Sprintf("sequence [%d] not found", req.Seq)}
-		s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
-		return
+	} else {
+		resp.Success = true
 	}
-	resp.Success = true
 	s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(resp))
 }
 
@@ -1282,7 +1293,7 @@ func (s *Server) jsStreamPurgeRequest(sub *subscription, c *client, subject, rep
 		return
 	}
 
-	fmt.Printf("[%s] Will process Purge since we are stream leader!!!\n", s.Name())
+	fmt.Printf("[%s] Will process Purge since we are stream leader!!!\n", s)
 
 	var resp = JSApiStreamPurgeResponse{ApiResponse: ApiResponse{Type: JSApiStreamPurgeResponseType}}
 	if !acc.JetStreamEnabled() {

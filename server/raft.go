@@ -1277,7 +1277,7 @@ func (n *raft) processAppendEntry(ae *appendEntry, sub *subscription) {
 					n.debug("Received transfer request for %q which is US!\n", e.Data)
 					n.campaign()
 				}
-				// These will not have commits follow them.
+				// These will not have commits follow them. We also know this will be by itself.
 				n.commit = ae.pindex + 1
 			case EntryAddPeer:
 				newPeer := string(e.Data)

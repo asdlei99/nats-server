@@ -844,8 +844,11 @@ func TestJetStreamClusterStreamCatchup(t *testing.T) {
 
 	fmt.Printf("\n\nRESTART OLD STREAM LEADER %v\n\n", sl)
 
-	c.restartServer(sl)
+	sl = c.restartServer(sl)
 	c.checkClusterFormed()
+
+	fmt.Printf("\n\nWAIT TO CATCHUP %v\n\n", sl)
+
 	c.waitOnServerCurrent(sl)
 }
 

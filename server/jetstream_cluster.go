@@ -49,6 +49,7 @@ const (
 	// Stream ops.
 	streamMsgOp
 	purgeStreamOp
+	deleteMsgOp
 	// Consumer ops
 	updateDeliveredOp
 	updateAcksOp
@@ -82,6 +83,17 @@ type streamAssignment struct {
 type streamPurge struct {
 	Client *ClientInfo `json:"client,omitempty"`
 	Stream string      `json:"stream"`
+	Reply  string      `json:"reply"`
+	// Internal
+	responded bool
+	err       error
+}
+
+// streamMsgDelete is what the stream leader will replicate when deleting a message.
+type streamMsgDelete struct {
+	Client *ClientInfo `json:"client,omitempty"`
+	Stream string      `json:"stream"`
+	Seq    uint64      `json:"seq"`
 	Reply  string      `json:"reply"`
 	// Internal
 	responded bool
@@ -805,7 +817,7 @@ func (js *jetStream) monitorStreamRaftGroup(mset *Stream, sa *streamAssignment) 
 }
 
 func (js *jetStream) applyStreamEntries(mset *Stream, ce *CommittedEntry) {
-	fmt.Printf("[%s] JS GROUP %q HAS STREAM ENTRIES UPDATE TO APPLY!\n", js.srv.Name(), mset.node.Group())
+	fmt.Printf("[%s] JS GROUP %q HAS STREAM ENTRIES UPDATE TO APPLY!\n", js.srv, mset.node.Group())
 	for _, e := range ce.Entries {
 		if e.Type == EntrySnapshot {
 			fmt.Printf("[%s] SNAPSHOT STREAM ENTRY\n", js.srv)
@@ -813,19 +825,54 @@ func (js *jetStream) applyStreamEntries(mset *Stream, ce *CommittedEntry) {
 			buf := e.Data
 			switch entryOp(buf[0]) {
 			case streamMsgOp:
-				subject, reply, hdr, msg, err := decodeStreamMsg(buf[1:])
+				subject, reply, hdr, msg, lseq, err := decodeStreamMsg(buf[1:])
 				if err != nil {
 					panic(err.Error())
 				}
 				fmt.Printf("[%s] DECODED %q %q %q %q\n\n", js.srv.Name(), subject, reply, hdr, msg)
-				mset.processJetStreamMsg(subject, reply, hdr, msg)
+				// processJetStreamMsg will respond to the client below if we are the leader.
+				if err := mset.processJetStreamMsg(subject, reply, hdr, msg, lseq); err != nil {
+					if err == errLastSeqMismatch {
+						// TODO(dlc) - Should we care here if this is < LastSeq vs not?
+						fmt.Printf("[%s] Ignoring message with expected seq of %d\n", js.srv, lseq+1)
+					} else {
+						panic(err.Error())
+					}
+				}
+			case deleteMsgOp:
+				//fmt.Printf("\n\n[%s] MSG DELETE DECODED CALLED\n\n", js.srv)
+				md, err := decodeMsgDelete(buf[1:])
+				if err != nil {
+					panic(err.Error())
+				}
+				s, cc := js.server(), js.cluster
+				fmt.Printf("[%s] MSG DELETE DECODED %+v\n\n", s, md)
+				removed, err := mset.EraseMsg(md.Seq)
+				if err != nil {
+					s.Warnf("JetStream cluster failed to delete msg %d from stream %q for account %q: %v", md.Seq, md.Stream, md.Client.Account, err)
+				}
+				js.mu.RLock()
+				isLeader := cc.isStreamLeader(md.Client.Account, md.Stream)
+				js.mu.RUnlock()
+				if isLeader {
+					fmt.Printf("[%s] MSG DELETE of %d, SHOULD RESPOND AS LEADER to %q\n\n", s, md.Seq, md.Reply)
+					var resp = JSApiMsgDeleteResponse{ApiResponse: ApiResponse{Type: JSApiMsgDeleteResponseType}}
+					if err != nil {
+						resp.Error = jsError(err)
+					} else if !removed {
+						resp.Error = &ApiError{Code: 400, Description: fmt.Sprintf("sequence [%d] not found", md.Seq)}
+					} else {
+						resp.Success = true
+					}
+					s.sendAPIResponse(md.Client, mset.account(), _EMPTY_, md.Reply, _EMPTY_, s.jsonResponse(resp))
+				}
 			case purgeStreamOp:
 				sp, err := decodeStreamPurge(buf[1:])
 				if err != nil {
 					panic(err.Error())
 				}
 				s := js.server()
-				fmt.Printf("[%s] PURGE DECODED %+v\n\n", js.srv.Name(), sp)
+				fmt.Printf("[%s] PURGE DECODED %+v\n\n", s, sp)
 				purged, err := mset.Purge()
 				if err != nil {
 					s.Warnf("JetStream cluster failed to purge stream %q for account %q: %v", sp.Stream, sp.Client.Account, err)
@@ -834,7 +881,7 @@ func (js *jetStream) applyStreamEntries(mset *Stream, ce *CommittedEntry) {
 				isLeader := js.cluster.isStreamLeader(sp.Client.Account, sp.Stream)
 				js.mu.RUnlock()
 				if isLeader {
-					fmt.Printf("[%s] PURGED %d, SHOULD RESPOND AS LEADER\n\n", js.srv.Name(), purged)
+					fmt.Printf("[%s] PURGED %d, SHOULD RESPOND AS LEADER\n\n", s, purged)
 					var resp = JSApiStreamPurgeResponse{ApiResponse: ApiResponse{Type: JSApiStreamPurgeResponseType}}
 					if err != nil {
 						resp.Error = jsError(err)
@@ -1586,6 +1633,41 @@ func (s *Server) jsClusteredConsumerDeleteRequest(ci *ClientInfo, stream, consum
 	cc.meta.Propose(encodeDeleteConsumerAssignment(ca))
 }
 
+func encodeMsgDelete(md *streamMsgDelete) []byte {
+	var bb bytes.Buffer
+	bb.WriteByte(byte(deleteMsgOp))
+	json.NewEncoder(&bb).Encode(md)
+	return bb.Bytes()
+}
+
+func decodeMsgDelete(buf []byte) (*streamMsgDelete, error) {
+	var md streamMsgDelete
+	err := json.Unmarshal(buf, &md)
+	return &md, err
+}
+
+func (s *Server) jsClusteredMsgDeleteRequest(ci *ClientInfo, stream, subject, reply string, seq uint64, rmsg []byte) {
+	fmt.Printf("[%s:%s]\tWill answer stream msg delete %d!\n", s, s.js.nodeID(), seq)
+	js, cc := s.getJetStreamCluster()
+	if js == nil || cc == nil {
+		return
+	}
+
+	js.mu.Lock()
+	defer js.mu.Unlock()
+
+	sa := js.streamAssignment(ci.Account, stream)
+	if sa == nil || sa.Group == nil || sa.Group.node == nil {
+		// TODO(dlc) - Should respond? Log?
+		return
+	}
+	n := sa.Group.node
+	md := &streamMsgDelete{Seq: seq, Stream: stream, Reply: reply, Client: ci}
+	err := n.Propose(encodeMsgDelete(md))
+
+	fmt.Printf("[%s:%s]\tDONE PROPOSE FOR stream msg delete %d - %v!\n", s, s.js.nodeID(), seq, err)
+}
+
 func encodeAddStreamAssignment(sa *streamAssignment) []byte {
 	var bb bytes.Buffer
 	bb.WriteByte(byte(assignStreamOp))
@@ -1695,59 +1777,63 @@ func decodeConsumerAssignment(buf []byte) (*consumerAssignment, error) {
 
 var errBadStreamMsg = errors.New("jetstream cluster bad replicated stream msg")
 
-func decodeStreamMsg(buf []byte) (subject, reply string, hdr, msg []byte, err error) {
+func decodeStreamMsg(buf []byte) (subject, reply string, hdr, msg []byte, lseq uint64, err error) {
 	var le = binary.LittleEndian
 	// FIXME(dlc) - Short buffer checks.
-	if len(buf) < 2 {
-		return _EMPTY_, _EMPTY_, nil, nil, errBadStreamMsg
+	if len(buf) < 20 {
+		return _EMPTY_, _EMPTY_, nil, nil, 0, errBadStreamMsg
 	}
+	lseq = le.Uint64(buf)
+	buf = buf[8:]
 	sl := int(le.Uint16(buf))
 	buf = buf[2:]
 	if len(buf) < sl {
-		return _EMPTY_, _EMPTY_, nil, nil, errBadStreamMsg
+		return _EMPTY_, _EMPTY_, nil, nil, 0, errBadStreamMsg
 	}
 	subject = string(buf[:sl])
 	buf = buf[sl:]
 	if len(buf) < 2 {
-		return _EMPTY_, _EMPTY_, nil, nil, errBadStreamMsg
+		return _EMPTY_, _EMPTY_, nil, nil, 0, errBadStreamMsg
 	}
 	rl := int(le.Uint16(buf))
 	buf = buf[2:]
 	if len(buf) < rl {
-		return _EMPTY_, _EMPTY_, nil, nil, errBadStreamMsg
+		return _EMPTY_, _EMPTY_, nil, nil, 0, errBadStreamMsg
 	}
 	reply = string(buf[:rl])
 	buf = buf[rl:]
 	if len(buf) < 2 {
-		return _EMPTY_, _EMPTY_, nil, nil, errBadStreamMsg
+		return _EMPTY_, _EMPTY_, nil, nil, 0, errBadStreamMsg
 	}
 	hl := int(le.Uint16(buf))
 	buf = buf[2:]
 	if len(buf) < hl {
-		return _EMPTY_, _EMPTY_, nil, nil, errBadStreamMsg
+		return _EMPTY_, _EMPTY_, nil, nil, 0, errBadStreamMsg
 	}
 	hdr = buf[:hl]
 	buf = buf[hl:]
 	if len(buf) < 4 {
-		return _EMPTY_, _EMPTY_, nil, nil, errBadStreamMsg
+		return _EMPTY_, _EMPTY_, nil, nil, 0, errBadStreamMsg
 	}
 	ml := int(le.Uint32(buf))
 	buf = buf[4:]
 	if len(buf) < ml {
-		return _EMPTY_, _EMPTY_, nil, nil, errBadStreamMsg
+		return _EMPTY_, _EMPTY_, nil, nil, 0, errBadStreamMsg
 	}
 	msg = buf[:ml]
-	return subject, reply, hdr, msg, nil
+	return subject, reply, hdr, msg, lseq, nil
 }
 
-func encodeStreamMsg(subject, reply string, hdr, msg []byte) []byte {
-	elen := 1 + len(subject) + len(reply) + len(hdr) + len(msg)
+func encodeStreamMsg(subject, reply string, hdr, msg []byte, lseq uint64) []byte {
+	elen := 1 + 8 + len(subject) + len(reply) + len(hdr) + len(msg)
 	elen += (2 + 2 + 2 + 4) // Encoded lengths, 4bytes
 	// TODO(dlc) - check sizes of subject, reply and hdr, make sure uint16 ok.
 	buf := make([]byte, elen)
 	buf[0] = byte(streamMsgOp)
 	var le = binary.LittleEndian
 	wi := 1
+	le.PutUint64(buf[wi:], lseq)
+	wi += 8
 	le.PutUint16(buf[wi:], uint16(len(subject)))
 	wi += 2
 	copy(buf[wi:], subject)
@@ -1773,5 +1859,7 @@ func encodeStreamMsg(subject, reply string, hdr, msg []byte) []byte {
 
 // processClusteredMsg will propose the inbound message to the underlying raft group.
 func (mset *Stream) processClusteredInboundMsg(subject, reply string, hdr, msg []byte) {
-	mset.node.Propose(encodeStreamMsg(subject, reply, hdr, msg))
+	mset.mu.RLock()
+	mset.node.Propose(encodeStreamMsg(subject, reply, hdr, msg, mset.lseq))
+	mset.mu.RUnlock()
 }
